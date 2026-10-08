@@ -1372,7 +1372,12 @@ def prepare_w4a16_x4t_weights(
     w13_rows = shape.w13_rows
     kimi = hidden_size == 3584 and intermediate_size in (3072, 1536, 768, 384, 256, 192)
     ds41 = hidden_size == 5120 and intermediate_size in (2304, 1152, 576, 288)
-    if not shape.is_gated or not (kimi or ds41):
+    # [heo overlay 2026-10-05] MiMo-V2.6-Pro TP1/2/4/8: hidden 6144, MoE
+    # intermediate 2048/TP. The X4T scale codec itself is geometry-agnostic
+    # (proven byte-exact on this exact geometry at A8 by the TP8 harness,
+    # plan-csf-encoder-mimo.md §19-B); this list gates *qualified* shapes.
+    mimo = hidden_size == 6144 and intermediate_size in (2048, 1024, 512, 256)
+    if not shape.is_gated or not (kimi or ds41 or mimo):
         raise ValueError(
             "X4T W4A16 requires gated Kimi TP1/2/4/8/12/16 or DS4.1 TP1/2/4/8 geometry"
         )

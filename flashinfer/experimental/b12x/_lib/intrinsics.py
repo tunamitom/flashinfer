@@ -4225,6 +4225,101 @@ def nvfp4_mma_m16n8k64_f32_e2m1(
 
 
 @dsl_user_op
+def mxfp4_mma_m16n8k64_f32_e2m1_ue8m0(
+    d0: Float32,
+    d1: Float32,
+    d2: Float32,
+    d3: Float32,
+    a0: Uint32,
+    a1: Uint32,
+    a2: Uint32,
+    a3: Uint32,
+    b0: Uint32,
+    b1: Uint32,
+    sfa: Uint32,
+    sfb: Uint32,
+    bid_a: int = 0,
+    tid_a: int = 0,
+    bid_b: int = 0,
+    tid_b: int = 0,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """SM120 MXFP4 block-scaled QMMA ``m16n8k64`` (E2M1 x E2M1, UE8M0 per-32).
+
+    Emits ``mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::2X.
+    m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0``.  The A/B/accumulator fragment
+    mapping is identical to :func:`nvfp4_mma_m16n8k64_f32_e2m1` (the 4X/UE4M3
+    variant); only the scale words differ: per-32 UE8M0 byte-pairs instead of
+    per-16 UE4M3 bytes.
+
+    Scale metadata (validated bit-exact against a float64 dequantize-and-matmul
+    oracle over multi-atom K loops and N>8 layouts -- w2-ladder R8-style
+    probes): the SFA word of lane ``L`` carries one A row's byte-pair --
+    row ``L>>2`` if ``L%4 == 0`` or row ``(L>>2)+8`` if ``L%4 == 1`` (lanes
+    ``L%4`` in {2, 3} unused), bytes 0/1 = the atom's K32 groups ``2g`` /
+    ``2g+1``.  The SFB word of lane ``L`` is valid for ``L%4 == 0`` only and
+    carries column ``L>>2``'s byte-pair (same byte order); the hardware reads
+    the word from the ``thread-id-b = 0`` lane.  ``bid_a``/``tid_a``/``bid_b``/
+    ``tid_b`` are the Table 46 defaults {0, 0} for both operands (either as
+    these i16 operands or literal ``{0, 0}`` -- both forms proven equivalent).
+    """
+    i16_ty = cutlass._mlir.ir.IntegerType.get_signless(16)
+
+    def _i16(v: int):
+        return cutlass._mlir.ir.Operation.create(
+            "llvm.mlir.constant",
+            results=[i16_ty],
+            attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(v))},
+        ).result
+
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a0).ir_value(loc=loc, ip=ip),
+            Uint32(a1).ir_value(loc=loc, ip=ip),
+            Uint32(a2).ir_value(loc=loc, ip=ip),
+            Uint32(a3).ir_value(loc=loc, ip=ip),
+            Uint32(b0).ir_value(loc=loc, ip=ip),
+            Uint32(b1).ir_value(loc=loc, ip=ip),
+            Uint32(sfa).ir_value(loc=loc, ip=ip),
+            _i16(bid_a),
+            _i16(tid_a),
+            Uint32(sfb).ir_value(loc=loc, ip=ip),
+            _i16(bid_b),
+            _i16(tid_b),
+            Float32(d0).ir_value(loc=loc, ip=ip),
+            Float32(d1).ir_value(loc=loc, ip=ip),
+            Float32(d2).ir_value(loc=loc, ip=ip),
+            Float32(d3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$0, $1, $2, $3},
+        {$10},
+        {$11, $12},
+        {$13},
+        {$14, $15};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,h,r,h,h,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
+    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
+    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
+    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
+    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+
+
+@dsl_user_op
 def mxfp8_mma_m16n8k32_f32_e2m1(
     d0: Float32,
     d1: Float32,
