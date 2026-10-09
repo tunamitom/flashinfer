@@ -192,26 +192,52 @@ def run(*, binding: Binding):
 
 
 def expand_scales(experts: PreparedExperts) -> bool:
-    """Expand every expert's NVFP4-CSF scales into its scratch on the experts' device stream.
+    """Expand every expert's compressed scales into scratch on the current stream.
 
-    A later ``bind(..., scales_expanded=True)`` for these experts skips the
-    per-call expansion. Callers that share one scratch across layers may run
-    this for the next layer on a side stream while other work proceeds; they
-    order it after the previous user of the scratch and before the bound call.
-    Micro-kernel calls still expand scales to reset their synchronization state.
-    Returns False, doing nothing, for experts without NVFP4-CSF scales.
+    NVFP4-CSF: a later ``bind(..., scales_expanded=True)`` for these experts
+    skips the per-call expansion.  MXFP4/X4T (paired-program W4A16 payload):
+    a later ``bind(..., x4t_scales_expanded=True)`` makes the X4T runners skip
+    their inline selective decode.  Callers that share one scratch across
+    layers may run this for the next layer on a side stream while other work
+    proceeds; they order it after the previous user of the scratch and before
+    the bound call.  Micro-kernel calls still expand scales to reset their
+    synchronization state.  Returns False, doing nothing, for experts without
+    compressed scales.
     """
     impl = experts._impl
     decoder = getattr(impl, "nvfp4_csf", None)
-    if decoder is None:
-        return False
-    expanded = impl.w4a16_expanded
-    with torch.cuda.device(experts.device):
-        if expanded is None:
-            decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
-        else:
-            decoder.decode_all(expanded.w13_scale, expanded.w2_scale)
-    return True
+    if decoder is not None:
+        expanded = impl.w4a16_expanded
+        with torch.cuda.device(experts.device):
+            if expanded is None:
+                decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
+            else:
+                decoder.decode_all(expanded.w13_scale, expanded.w2_scale)
+        return True
+    capability = getattr(impl, "x4t_prefetch", None)
+    if capability is not None:
+        # Prepared full-X4T expansion using the EXISTING paired program: the
+        # retained counts program (index 1) over a persistent all-ones int32
+        # counts buffer of E entries.  Counts MUST be positive: zero counts
+        # select no experts, and zero IDs in ordinary IDs mode select only
+        # expert 0.  This expands EVERY expert into the packed w13_scale/
+        # w2_scale destinations the inline decode would write (rotation and
+        # clamping come from the compiled program, identical to the selective
+        # decode), so any later selective decode is a subset of this output.
+        from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scale_pair
+
+        first, second = capability.planes
+        decode_x4t_packed_scale_pair(
+            first,
+            second,
+            capability.counts,
+            impl.w1_blockscale,
+            impl.w2_blockscale,
+            expert_counts=True,
+            program=capability.programs[1],
+        )
+        return True
+    return False
 
 
 def uses_expanded_nvfp4_scales(

@@ -1373,12 +1373,15 @@ class W4A16A4PrefillLaunches:
         """Bytes of ``intermediate_cache2`` the pipeline carves for ``tokens``."""
         return _carve_layout(self, int(tokens))[-1]
 
+    def cache13_bytes(self, tokens: int) -> int:
+        """Bytes of ``intermediate_cache13`` (per-route BF16 FC2 rows) the
+        pipeline needs for ``tokens``."""
+        return int(tokens) * self.topk * self.hidden_size * 2
+
     def fits_buffers(self, tokens: int, cache13_bytes: int, cache2_bytes: int) -> bool:
-        return cache13_bytes >= int(
+        return cache13_bytes >= self.cache13_bytes(
             tokens
-        ) * self.topk * self.hidden_size * 2 and cache2_bytes >= self.scratch_bytes(
-            tokens
-        )
+        ) and cache2_bytes >= self.scratch_bytes(tokens)
 
 
 def _fake(dtype, align=16):
@@ -1575,6 +1578,86 @@ def a4_prefill_fits(
         intermediate_cache13.numel() * intermediate_cache13.element_size(),
         intermediate_cache2.numel() * intermediate_cache2.element_size(),
     )
+
+
+@dataclass(frozen=True)
+class _A4RoutePackCapacity:
+    """Route-pack slot/block counts baked into one planned A4 carve."""
+
+    max_packed_routes: int
+    max_route_blocks: int
+
+
+def a4_prefill_sizing_launches(
+    *,
+    tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    terms: int,
+    max_packed_routes: int,
+    max_route_blocks: int,
+) -> W4A16A4PrefillLaunches:
+    """A launch-shaped sizing carrier exposing the compiled launches' own
+    ``scratch_bytes()`` / ``cache13_bytes()`` / ``fits_buffers()`` without
+    compiling kernels (kernel slots are None and must not be launched).
+
+    ``max_packed_routes`` / ``max_route_blocks`` are the route-pack capacities
+    the A4 launch set is compiled with (padded route slots and route blocks at
+    ``A4_PREFILL_ROUTE_BLOCK``); ``num_experts`` is the effective route expert
+    count. Both the planner reservation and the admission tests size through
+    this carrier, so neither can drift from the runner's ``_carve_layout``.
+    """
+    return W4A16A4PrefillLaunches(
+        tokens=int(tokens),
+        hidden_size=int(hidden_size),
+        intermediate_size=int(intermediate_size),
+        num_experts=int(num_experts),
+        topk=int(topk),
+        grid=1,
+        terms=int(terms),
+        quant=None,
+        fc1=None,
+        fc2=None,
+        topk_sum=None,
+        route_pack=_A4RoutePackCapacity(
+            max_packed_routes=int(max_packed_routes),
+            max_route_blocks=int(max_route_blocks),
+        ),
+    )
+
+
+def a4_prefill_workspace_requirements(
+    *,
+    tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    topk: int,
+    terms: int,
+    max_packed_routes: int,
+    max_route_blocks: int,
+) -> tuple[int, int]:
+    """Bytes of ``intermediate_cache2`` and ``intermediate_cache13`` the A4
+    prefill pipeline carves for one planned capacity.
+
+    This reuses the compiled launches' own ``scratch_bytes()`` /
+    ``cache13_bytes()`` (and therefore ``_carve_layout``) so the planner's
+    reservation can never drift from the runner's carve: it is the same code,
+    not a second hand formula. Returns ``(cache2_bytes, cache13_bytes)``.
+    """
+    launches = a4_prefill_sizing_launches(
+        tokens=tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        topk=topk,
+        terms=terms,
+        max_packed_routes=max_packed_routes,
+        max_route_blocks=max_route_blocks,
+    )
+    return launches.scratch_bytes(tokens), launches.cache13_bytes(tokens)
 
 
 def run_w4a16_a4_prefill(

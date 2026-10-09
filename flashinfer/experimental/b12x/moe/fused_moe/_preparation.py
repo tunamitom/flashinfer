@@ -401,6 +401,42 @@ class _W4A16PrimaryLaunches:
     a4_prefill: object | None = None
     a4_prefill_expanded: object | None = None
     csf_stage_max_tokens: int = 1536
+    # Default-OFF MXFP4-activation prefill over the packed e8m0_k32 weights
+    # (B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS > 0 compiles it; 0 = never built).
+    mxfp4_prefill: object | None = None
+
+    def select_mxfp4(
+        self,
+        *,
+        tokens: int,
+        route_ids_dtype: torch.dtype,
+        has_route_map: bool,
+        activation_amax: object | None,
+        apply_router_weight_on_input: bool,
+        force: bool | None = None,
+    ) -> object | None:
+        """The MXFP4 prefill launch set for calls at or above its threshold.
+
+        Parallel of ``select_a4``: ``force`` overrides the threshold (True takes
+        the launches for any call within their capacity, False never does).
+        ``None`` when the gate never compiled the path, the call is outside its
+        capacity/threshold, or routing is not plain top-k.  Nonunit activation
+        globals are additionally rejected at bind by the kernel module's
+        admission; this selector never inspects device values.
+        """
+        launches = self.mxfp4_prefill
+        if (
+            launches is None
+            or force is False
+            or (force is None and int(tokens) < launches.min_tokens)
+            or int(tokens) > launches.tokens
+            or route_ids_dtype not in (torch.int32, torch.int64)
+            or has_route_map
+            or activation_amax is not None
+            or apply_router_weight_on_input
+        ):
+            return None
+        return launches
 
     def select_a4(
         self,
@@ -513,6 +549,7 @@ class _W4A16PrimaryLaunches:
                     if self.a4_prefill_expanded is None
                     else self.a4_prefill_expanded.carriers()
                 ),
+                *(() if self.mxfp4_prefill is None else self.mxfp4_prefill.carriers()),
             )
             if launcher is not None
         )
@@ -767,6 +804,47 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 a4_prefill_expanded = compile_w4a16_a4_prefill(
                     **a4_args, csf_inline_words=None
                 )
+        # Default-OFF MXFP4 prefill: compiled only when the gate is set (>0) and
+        # the plan admits the packed e8m0_k32 payload.  A failed/absent compile
+        # is not fatal: the call stays on today's W4A16 path (fallback).
+        mxfp4_prefill = None
+        from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+            compile_w4a16_mxfp4_prefill,
+            mxfp4_prefill_min_tokens,
+            mxfp4_prefill_supported,
+            mxfp4_prefill_terms,
+        )
+
+        mxfp4_min = mxfp4_prefill_min_tokens()
+        if (
+            mxfp4_min > 0
+            and tokens >= mxfp4_min
+            and core.route_E == core.weight_E
+            and not caps.apply_router_weight_on_input
+            and mxfp4_prefill_supported(
+                prepared_layout=weight_layout,
+                scale_format=scale_format,
+                activation=core.activation,
+                is_gated=core.activation in {"silu"},
+                dtype=core.dtype,
+                hidden_size=core.k,
+                intermediate_size=core.n,
+                terms=mxfp4_prefill_terms(),
+                swiglu_limit=core.swiglu_limit,
+            )
+        ):
+            mxfp4_prefill = compile_w4a16_mxfp4_prefill(
+                tokens=tokens,
+                min_tokens=mxfp4_min,
+                topk=core.num_topk,
+                hidden_size=core.k,
+                intermediate_size=core.n,
+                num_experts=core.weight_E,
+                sms=int(props.multi_processor_count),
+                ordinal=core.device.index,
+                fast_math=bool(caps.w4a16_fast_math),
+                terms=mxfp4_prefill_terms(),
+            )
     # Direct routing requires exact M; packed routing accepts live M up to capacity.
     return _W4A16PrimaryLaunches(
         tokens=int(caps.max_tokens),
@@ -782,6 +860,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
         a4_prefill=a4_prefill,
         a4_prefill_expanded=a4_prefill_expanded,
         csf_stage_max_tokens=caps.w4a16_csf_stage_max_tokens,
+        mxfp4_prefill=mxfp4_prefill,
     )
 
 

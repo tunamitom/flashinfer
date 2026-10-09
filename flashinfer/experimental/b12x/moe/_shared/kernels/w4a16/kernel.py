@@ -10567,10 +10567,10 @@ def _small_m_direct_host_barrier_reset_enabled() -> bool:
 
     The micro-kernel barrier resets its arrival counter and advances its epoch
     before releasing the grid, so completed launches can safely reuse both
-    scalars.  Keep the historical host reset as the default while the
-    persistent-epoch path is evaluated independently and end-to-end.
+    scalars without host-side fills. Set the environment variable to ``1`` to
+    restore the redundant host reset for diagnostics.
     """
-    return os.environ.get("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "1") != "0"
+    return os.environ.get("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "0") != "0"
 
 
 def _compile_w4a16_small_m_direct(
@@ -13821,6 +13821,7 @@ def run_w4a16_moe(
     rotation_a_up: torch.Tensor | None = None,
     route_mode: str = "auto",
     route_pack_launches=None,
+    x4t_scales_expanded: bool = False,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
@@ -14196,9 +14197,12 @@ def run_w4a16_moe(
             raise RuntimeError(
                 "W4A16 small-M direct path requires prepared micro scale metadata"
             )
-        if use_x4t_scale_predecode:
+        if use_x4t_scale_predecode and not x4t_scales_expanded:
             # Native and packed GEMMs consume the same expanded scale grid.
             # The early-return micro path must refresh it before every launch.
+            # Skipped when the caller pre-expanded every expert's scales into
+            # this payload's scale scratch (bind x4t_scales_expanded=True; the
+            # micro scales are views of that same scratch).
             from b12x._lib.quant.x4t_packed_scales import _launch_x4t_packed_scale_pair
 
             programs = prepared.x4t_packed_pair_programs
@@ -14452,10 +14456,15 @@ def run_w4a16_moe(
         route_slots_for_scratch = int(packed_route_indices.numel())
         required_m_blocks = int(block_expert_ids.numel())
 
-    if use_x4t_scale_predecode:
+    if use_x4t_scale_predecode and not x4t_scales_expanded:
         # X4T keeps the exact nibble weights resident and expands only the
         # scale planes of experts touched by this routed call. The scratch is
         # caller-owned and may be shared across all layers on this stream.
+        # Skipped when the caller pre-expanded every expert's scales into this
+        # payload's scale scratch (bind x4t_scales_expanded=True): the
+        # all-expert expansion is a superset of this selective decode for
+        # every route arm (direct IDs, packed counts, packed sorted blocks),
+        # so the inline launch would be duplicate work.
         from b12x._lib.quant.x4t_scales import (
             decode_x4t_tp12_w4a16_scales,
         )

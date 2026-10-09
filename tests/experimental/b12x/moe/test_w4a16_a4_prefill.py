@@ -510,8 +510,13 @@ def test_csf_prefetch_query_matches_exact_variant_and_precision(
                 calibrated and choice is True
             ), (tokens, choice)
             if calibrated and choice is True and tokens == 4:
+                # Since the plan-time A4 workspace reservation (2026-10-09),
+                # the exact 4-row variant reserves the padded-route carve
+                # itself and binds its own A4 launch; previously its stock
+                # buffers could not hold the carve and the call borrowed the
+                # 3072 variant's launch.
                 assert binding.a4_prefill_launches is (
-                    plan._prepared.state.variants[3072].w4a16_launches.a4_prefill
+                    plan._prepared.state.variants[4].w4a16_launches.a4_prefill
                 )
             moe.run(binding=binding)
             torch.cuda.synchronize()
@@ -521,8 +526,12 @@ def test_csf_prefetch_query_matches_exact_variant_and_precision(
         with pytest.raises(ValueError, match="capacity"):
             moe.uses_expanded_nvfp4_scales(plan, num_tokens=tokens)
     if calibrated:
-        # Without a larger prepared variant, the exact four-row plan retains
-        # A16 when its intermediate buffers cannot hold padded A4 routes.
+        # Since the plan-time A4 workspace reservation (2026-10-09), the exact
+        # four-row plan reserves the padded-route carve itself and admits A4
+        # at its own capacity (previously its stock buffers could not hold the
+        # carve and the call stayed A16 without a larger borrowed variant).
+        # The short-buffer fallback contract is preserved below via an
+        # explicitly undersized plan; fits_buffers remains authoritative.
         small = _plan(owner, 4)
         small_scratch = tuple(
             torch.empty(s.shape, dtype=s.dtype, device=device)
@@ -537,7 +546,10 @@ def test_csf_prefetch_query_matches_exact_variant_and_precision(
             small_scratch,
             a4_prefill=True,
         )
-        assert binding.a4_prefill_launches is None
+        assert binding.a4_prefill_launches is (
+            small._prepared.state.w4a16_launches.a4_prefill
+        )
+        assert binding.a4_prefill_launches.tokens == 4
         assert not moe.uses_expanded_nvfp4_scales(small, num_tokens=4, a4_prefill=True)
         # A4 cannot use a plan whose intermediate buffers do not fit its planes.
         root = plan._prepared.state

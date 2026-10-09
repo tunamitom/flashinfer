@@ -430,6 +430,59 @@ class _PreparedWeightRepresentation:
 
 
 @dataclass(frozen=True, kw_only=True)
+class X4TPrefetchCapability:
+    """Retained all-expert X4T scale expansion for one prepared W4A16 payload.
+
+    Built at preparation time (``prepare_b12x_x4t_weights``): the paired X4T
+    planes, the retained paired programs and the packed ``w13_scale``/
+    ``w2_scale`` scratch destinations the inline decode would write, plus the
+    persistent selector buffer the expansion needs.  ``expand_scales`` uses
+    this to expand EVERY expert into the shared scratch ahead of the call;
+    a matching ``bind(..., x4t_scales_expanded=True)`` then makes the X4T
+    runners skip their inline decode launch (see that flag's contract).
+
+    Selector legality (proven byte-equal to the selective decode): the
+    serving arm is ``counts`` -- an all-ones int32 buffer of E entries with
+    ``expert_counts=True`` and the retained counts program at index 1 of
+    ``programs``.  Counts must be POSITIVE: zero counts select no experts,
+    and zero IDs in ordinary IDs mode select only expert 0.  The documented
+    alternative arm -- a persistent int32 ``arange(E)`` with the retained
+    ordinary-IDs program at index 0 and its default flags (never set
+    ``expert_ids_unique=True`` for a program compiled for ``unique=False``)
+    -- is intentionally NOT allocated: this serving implementation only ever
+    expands through counts mode, so allocating the unused IDs buffer for
+    every paired X4T payload (even with vLLM's prefetch gate OFF) would be
+    pure waste.  Re-add it at the call site if an IDs-mode arm is ever
+    needed (Codex review: gate-OFF preparation cost must be near zero).
+
+    Destinations are NOT stored here: ``expand_scales`` writes the expert
+    package's canonical ``w1_blockscale``/``w2_blockscale`` handles (the shared
+    scratch views), so a storage-reusing weight reload cannot leave this
+    capability pointing at replaced tensors.
+    """
+
+    planes: tuple
+    programs: tuple
+    counts: torch.Tensor
+
+
+def _x4t_prefetch_capability(value: Any) -> X4TPrefetchCapability | None:
+    """The all-expert expansion capability of a prepared X4T payload, if any."""
+    programs = getattr(value, "x4t_packed_pair_programs", None)
+    first = getattr(value, "x4t_w13_scale", None)
+    second = getattr(value, "x4t_w2_scale", None)
+    if programs is None or first is None or second is None:
+        return None
+    device = value.w13_scale.device
+    experts = int(first.num_experts)
+    return X4TPrefetchCapability(
+        planes=(first, second),
+        programs=programs,
+        counts=torch.ones(experts, dtype=torch.int32, device=device),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class B12XFP4ExpertWeights:
     """The sole owner and complete runtime contract for FP4 MoE experts.
 
@@ -455,6 +508,10 @@ class B12XFP4ExpertWeights:
     # planned above the stage-scale token limit (nvfp4_csf expands into it).
     w4a16_expanded: object | None = None
     mxfp4_csf: object | None = None
+    # Retained all-expert X4T scale expansion for the paired-program payload
+    # (X4TPrefetchCapability).  Built at preparation; None for every payload
+    # without paired X4T planes/programs (including all NVFP4 and A8 owners).
+    x4t_prefetch: object | None = None
     # Compact W4A8 experts prepared from MXFP4-CSF checkpoints whose kernels read
     # compressed scales inline: (w13, w2) Mxfp4CsfInlinePlane. The canonical scale
     # fields keep the caller's expansion scratch, which these launches never read.
@@ -575,6 +632,35 @@ class B12XFP4ExpertWeights:
                 raise ValueError(
                     "FC2 shape does not match the prepared plan: "
                     f"actual={actual_w2}, expected={expected_w2}"
+                )
+
+        from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+            mxfp4_prefill_min_tokens as _a4_min_tokens,
+            mxfp4_prefill_scale_format_supported as _a4_scale_ok,
+            validate_activation_globals as _a4_validate_globals,
+        )
+
+        if (
+            _a4_min_tokens() > 0
+            and not self.a1_gscale.is_meta
+            and _a4_scale_ok(self.plan.w4a16_scale_format)
+        ):
+            # W2 MXFP4 prefill: warm the unit-global admission verdict now,
+            # at weight prep, BEFORE CUDA-graph capture. Under capture with a
+            # cold cache the admission returns False and the graph bakes A16
+            # permanently (probe 2026-10-06: 95 binds/rank). validate is
+            # idempotent (fingerprint cache, cached verdict short-circuits the
+            # device sync) and capture-safe here. Gate-OFF / ineligible
+            # objects skip this entirely (no device work when disabled).
+            try:
+                _a4_validate_globals(self.a1_gscale, self.a2_gscale)
+            except Exception as exc:  # observable: never hide a warm failure
+                import sys as _sys
+
+                print(
+                    f"[a4warn] activation-globals warm failed: {exc!r}",
+                    file=_sys.stderr,
+                    flush=True,
                 )
 
         if (
@@ -1015,6 +1101,7 @@ class TPMoEScratchPlan:
         output_expert_map: torch.Tensor | None = None,
         scales_expanded: bool = False,
         a4_prefill: bool | None = None,
+        x4t_scales_expanded: bool = False,
         _w4a16_launches: object | None = None,
     ) -> "TPMoEFP4Binding":
         """Bind live tensors to this scratch plan.
@@ -1028,9 +1115,31 @@ class TPMoEScratchPlan:
         ``a4_prefill=True`` selects prepared NVFP4 activation launches.
         False and None keep W4A16 regardless of token count. Unsupported
         calls and uncalibrated weights remain W4A16.
+
+        ``x4t_scales_expanded`` is the X4T twin of ``scales_expanded``: it
+        states that the prepared payload's X4T scale planes were expanded into
+        the shared packed ``w13_scale``/``w2_scale`` scratch (every expert, e.g.
+        via ``expand_scales``) after the last other reader of that scratch and
+        before this call, on this call's stream or one it waits for.  The X4T
+        runners then skip their inline ``decode_x4t_packed_scale_pair`` launch.
+        Declare it only for a call whose route ABI is covered by the prefetch
+        (a full-expansion prefetch covers every route ABI); the flag is
+        per-call and never persists.
         """
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
+        if x4t_scales_expanded and (
+            self.caps.quant_mode != "w4a16" or experts.x4t_prefetch is None
+        ):
+            # Reject rather than silently assume the consumer will skip: only
+            # the W4A16 X4T runners consult the flag, and only a payload with a
+            # retained all-expert expansion (paired programs) can have been
+            # prefetched. Every other path (A8 MXFP4, NVFP4, inline, tp12-only
+            # X4T) must run its own expansion.
+            raise ValueError(
+                "x4t_scales_expanded requires a W4A16 plan whose experts "
+                "retain the paired-program X4T expansion capability"
+            )
         weight_plan = experts.plan
         if (
             weight_plan.w4a16_compressed_scales
@@ -1101,6 +1210,7 @@ class TPMoEScratchPlan:
         topk_sum_launch = None
         route_pack_launches = None
         a4_prefill_launches = None
+        mxfp4_prefill_launches = None
         if (
             self.caps.quant_mode == "w4a16"
             and not self._core_workspace_plan.full_rotation
@@ -1131,6 +1241,55 @@ class TPMoEScratchPlan:
                     force=a4_prefill,
                     scales_expanded=scales_expanded,
                 )
+            # Default-OFF MXFP4 prefill (B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS):
+            # admitted only for the packed e8m0_k32 payload with unit activation
+            # globals (validated once at bind, capture-safe).  Anything else
+            # falls through to today's W4A16 path unchanged.
+            select_mxfp4 = getattr(_w4a16_launches, "select_mxfp4", None)
+            if select_mxfp4 is not None:
+                candidate = select_mxfp4(
+                    tokens=int(a.shape[0]),
+                    route_ids_dtype=topk_ids.dtype,
+                    has_route_map=(
+                        route_expert_map is not None or output_expert_map is not None
+                    ),
+                    activation_amax=activation_amax,
+                    apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
+                    force=a4_prefill,
+                )
+                if candidate is not None:
+                    from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+                        mxfp4_prefill_activation_globals_admitted,
+                        mxfp4_prefill_fits,
+                        mxfp4_prefill_supported,
+                    )
+
+                    prepared_layout = self.caps.w4a16_weight_layout or "packed"
+                    scale_format = self.caps.w4a16_scale_format or "e4m3_k16"
+                    if (
+                        mxfp4_prefill_supported(
+                            prepared_layout=prepared_layout,
+                            scale_format=scale_format,
+                            activation=experts.activation,
+                            is_gated=experts.activation in {"silu"},
+                            dtype=a.dtype,
+                            hidden_size=int(a.shape[1]),
+                            intermediate_size=experts.intermediate_size,
+                            terms=candidate.terms,
+                            swiglu_limit=self.caps.swiglu_limit,
+                        )
+                        and mxfp4_prefill_activation_globals_admitted(
+                            experts.a1_gscale,
+                            experts.a2_gscale,
+                        )
+                        and mxfp4_prefill_fits(
+                            candidate,
+                            tokens=int(a.shape[0]),
+                            intermediate_cache13=tensors["intermediate_cache13"],
+                            intermediate_cache2=tensors["intermediate_cache2"],
+                        )
+                    ):
+                        mxfp4_prefill_launches = candidate
         elif (
             self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation
         ):
@@ -1200,6 +1359,8 @@ class TPMoEScratchPlan:
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
             a4_prefill_launches=a4_prefill_launches,
+            mxfp4_prefill_launches=mxfp4_prefill_launches,
+            x4t_scales_expanded=bool(x4t_scales_expanded),
         )
         return replace(
             binding,
@@ -1304,6 +1465,15 @@ class TPMoEFP4Binding:
     # The caller expanded every expert's NVFP4-CSF scales with expand_scales().
     scales_expanded: bool = False
     w4a8_csf_inline: bool = False
+    # Default-OFF MXFP4-activation prefill over the packed e8m0_k32 weights
+    # (B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS; selected at bind, prefill only).
+    mxfp4_prefill_launches: object | None = None
+    # The caller expanded every expert's X4T scale planes into this payload's
+    # packed w13_scale/w2_scale scratch after the scratch's last reader and
+    # before this call (e.g. via expand_scales on a side stream this call waits
+    # for). The W4A16 X4T runners then skip their inline
+    # decode_x4t_packed_scale_pair launch. Per-call; never persists.
+    x4t_scales_expanded: bool = False
     mixed_trellis_binding: object | None = None
     mixed_trellis_buffers: object | None = None
 
@@ -3029,9 +3199,19 @@ def _build_tp_moe_fp4_binding_from_views(
     topk_sum_launch: object | None = None,
     route_pack_launches: object | None = None,
     a4_prefill_launches: object | None = None,
+    mxfp4_prefill_launches: object | None = None,
+    x4t_scales_expanded: bool = False,
 ) -> TPMoEFP4Binding:
     if not isinstance(experts, B12XFP4ExpertWeights):
         raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
+    if x4t_scales_expanded and plan.implementation != "w4a16":
+        # Only the W4A16 runners consult the X4T scale-prefetch readiness flag.
+        # Reject every unsupported implementation (micro/dynamic/mixed) rather
+        # than silently assuming its consumer will skip its own expansion.
+        raise ValueError(
+            "x4t_scales_expanded is only supported for W4A16 bindings; got "
+            f"implementation={plan.implementation!r}"
+        )
     if a.ndim != 2:
         raise ValueError(
             f"expected input activations with rank 2, got {tuple(a.shape)}"
@@ -3232,6 +3412,8 @@ def _build_tp_moe_fp4_binding_from_views(
             topk_sum_launch=topk_sum_launch,
             route_pack_launches=route_pack_launches,
             a4_prefill_launches=a4_prefill_launches,
+            mxfp4_prefill_launches=mxfp4_prefill_launches,
+            x4t_scales_expanded=x4t_scales_expanded,
         )
 
     if plan.implementation == "micro":
@@ -3367,6 +3549,8 @@ def _plan_core_workspace(
     route_num_experts: int | None = None,
     w4a16_block_size_m: int | None = None,
     w4a16_prefill_fused_sum: bool | None = None,
+    w4a16_a4_prefill_enabled: bool = False,
+    w4a16_a4_prefill_terms: int = 1,
     trellis_bits: int = 3,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
     trellis_pair_kinds: frozenset[str] | None = None,
@@ -3734,7 +3918,135 @@ def _plan_core_workspace(
                 align_up(direct_cache2_nbytes, _dtype_nbytes(dtype))
                 // _dtype_nbytes(dtype),
             )
+        # W2 MXFP4-A4 prefill workspace (Codex A2): the A4 pipeline carves
+        # quantization planes + route metadata out of cache2 and needs the
+        # per-route FC2 rows in cache13. Reserve the max of the A16 and A4
+        # requirements at plan time so mxfp4_prefill_fits cannot fail on
+        # scratch shortage at supported chunk sizes (2048/4096-token capacity).
+        # R2-fix (2026-10-06): reserve cache2 for the MXFP4-A4 prefill carve
+        # when the gate compiles it. Arithmetic replicates the kernel's
+        # _carve_layout EXACTLY (verified vs the compiled launches' own
+        # scratch_bytes at 512/1024/2048/4071/4096 live tokens, 2026-10-06:
+        # 19,091,712 @4071 matched to the byte). An earlier hand-rolled
+        # estimate ran 82KB short at capacity and all 69 layers' fits()
+        # rejected (probe: have 19,009,792 < need 19,091,712).
+        try:
+            _gate = int(os.environ.get("B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS", "0") or 0)
+        except Exception:
+            _gate = 0
+        try:
+            from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+                mxfp4_prefill_terms as _a4_terms_fn,
+            )
+
+            _a4_terms = int(_a4_terms_fn())
+        except Exception:
+            _a4_terms = 1
+        _a4_off = 0
+        _a4_routes = 0
+        if _gate > 0 and token_capacity >= _gate:
+            from b12x.moe._shared.kernels.w4a16.host import (
+                route_pack_token_capacity as _rptc,
+                max_packed_route_slots as _mprs,
+            )
+            from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+                MXFP4_PREFILL_ROUTE_BLOCK as _RB,
+            )
+
+            _a4_t = int(token_capacity)
+            _a4_routes = _a4_t * int(num_topk)
+            _a4_numel_cap = _rptc(_a4_t, int(num_topk)) * int(num_topk)
+            _a4_pr = max(_mprs(_a4_numel_cap, _RB, int(route_E)), 1)
+            _a4_rbl = (_a4_pr + _RB - 1) // _RB
+            _a4_sizes = (
+                _a4_terms * _a4_t * int(k) // 2,
+                _a4_terms * _a4_t * (int(k) // 64) * 4,
+                _a4_terms * _a4_routes * int(n) // 2,
+                _a4_terms * _a4_routes * (int(n) // 64) * 4,
+                _a4_pr * 4,
+                _a4_rbl * 4,
+                4,
+                (int(route_E) + 1) * 4,
+                int(route_E) * 4,
+            )
+            _a4_off = 0
+            for _s in _a4_sizes:
+                _a4_off = (_a4_off + _s + 255) // 256 * 256
+            _a4_ebytes = torch.empty(0, dtype=dtype).element_size()
+            intermediate_cache2_elements = max(
+                intermediate_cache2_elements,
+                (_a4_off + _a4_ebytes - 1) // _a4_ebytes,
+            )
         cache_dtype = torch.float16 if full_rotation else dtype
+        # NVFP4 A4 prefill workspace (B12X_W4A16_A4_PREFILL): the A4 pipeline
+        # carves quantized input/intermediate planes, their scales, and padded
+        # route metadata out of cache2 and keeps one BF16 FC2 row per route in
+        # cache13. The carve exceeds the ordinary A16 allocation at GLM's
+        # prefill chunk sizes (38,146,560 B vs 33,554,432 B at 8192 tokens,
+        # terms=1), so select_a4()/fits_buffers() silently fell back to W4A16
+        # for near-full chunks. Reserve max(A16, A4) for cache2/cache13 at plan
+        # time, gated on the plan's frozen A4 controls (never the MXFP4 env
+        # knob) and mirroring the A4 compile admission in
+        # _w4a16_primary_launches exactly (route namespace match, no
+        # router-weight-on-input, supported packed/NVFP4 geometry). Sizing goes
+        # through the kernel's own carve (a4_prefill_workspace_requirements ->
+        # W4A16A4PrefillLaunches.scratch_bytes/_carve_layout), never a second
+        # hand formula. Flag-off plans keep the stock sizes; an enabled hybrid
+        # plan reserves the enlarged buffers even when a given call binds A16
+        # (the reservation is plan-level, not per-bind).
+        _a4_cache13_elements = 0
+        if (
+            w4a16_a4_prefill_enabled
+            and route_E == int(weight_E)
+            and not apply_router_weight_on_input
+        ):
+            from b12x.moe._shared.kernels.w4a16.host import (
+                max_packed_route_slots as _a4_mprs,
+                route_pack_token_capacity as _a4_rptc,
+            )
+            from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
+                A4_PREFILL_ROUTE_BLOCK as _A4_RB,
+                a4_prefill_supported as _a4_supported,
+                a4_prefill_workspace_requirements as _a4_requirements,
+            )
+
+            if _a4_supported(
+                prepared_layout=weight_layout,
+                scale_format=scale_format,
+                activation=activation,
+                is_gated=activation == "silu",
+                swiglu_limit=swiglu_limit,
+                dtype=dtype,
+                hidden_size=int(k),
+                intermediate_size=int(n),
+            ):
+                _a4_tokens = int(token_capacity)
+                _a4_numel_cap = _a4_rptc(_a4_tokens, int(num_topk)) * int(num_topk)
+                _a4_pr = max(_a4_mprs(_a4_numel_cap, _A4_RB, route_E), 1)
+                _a4_rbl = (_a4_pr + _A4_RB - 1) // _A4_RB
+                _a4_terms = (
+                    int(w4a16_a4_prefill_terms)
+                    if int(w4a16_a4_prefill_terms) in (1, 2)
+                    else 1
+                )
+                _a4_cache2_bytes, _a4_cache13_bytes = _a4_requirements(
+                    tokens=_a4_tokens,
+                    hidden_size=int(k),
+                    intermediate_size=int(n),
+                    num_experts=route_E,
+                    topk=int(num_topk),
+                    terms=_a4_terms,
+                    max_packed_routes=_a4_pr,
+                    max_route_blocks=_a4_rbl,
+                )
+                _a4_ebytes = _dtype_nbytes(cache_dtype)
+                intermediate_cache2_elements = max(
+                    intermediate_cache2_elements,
+                    (_a4_cache2_bytes + _a4_ebytes - 1) // _a4_ebytes,
+                )
+                _a4_cache13_elements = (
+                    _a4_cache13_bytes + _a4_ebytes - 1
+                ) // _a4_ebytes
         use_prefill_fused_sum = prefill_fused_sum_eligible(
             dtype=dtype,
             m=token_capacity,
@@ -3751,6 +4063,24 @@ def _plan_core_workspace(
             if use_prefill_fused_sum
             else routed_capacity * max(fc1_cols, int(k))
         )
+        # W2 MXFP4-A4 prefill workspace (Codex A2): A4 stores one BF16 FC2 row
+        # per ROUTE (tokens*topk*H), far larger than the A16 fused-sum plan at
+        # 2048/4096-token capacity. Reserve the max (only when the A4 gate
+        # sized a carve above; _a4_routes is 0 otherwise).
+        if _a4_routes > 0:
+            intermediate_cache13_elements = max(
+                intermediate_cache13_elements,
+                _a4_routes * int(k),
+            )
+        # NVFP4 A4 prefill workspace: cache13 must also fit one BF16 FC2 row
+        # per route — tokens * topk * hidden_size ELEMENTS, i.e. that product
+        # times 2 bytes — for the admitted A4 pipeline (fits_buffers checks
+        # both planes together).
+        if _a4_cache13_elements > 0:
+            intermediate_cache13_elements = max(
+                intermediate_cache13_elements,
+                _a4_cache13_elements,
+            )
         tensor_specs = [
             _TensorAllocSpec(
                 "intermediate_cache13",
@@ -7151,6 +7481,11 @@ def prepare_b12x_x4t_weights(*, plan, weights) -> B12XFP4ExpertWeights:
             else PreparedWeightLayout.MMA_PACKED,
             value=value,
         ),
+        # All-expert X4T scale prefetch: paired programs retain the counts
+        # (index 1) and ordinary-IDs (index 0) route ABIs; the capability keeps
+        # the persistent selector buffers alongside the packed scale
+        # destinations the inline decode would write.
+        x4t_prefetch=_x4t_prefetch_capability(value),
     )
 
 
@@ -8300,6 +8635,8 @@ def plan_tp_moe_arena_layout(
     deterministic_output: bool | None = None,
     w4a16_block_size_m: int | None = None,
     w4a16_prefill_fused_sum: bool | None = None,
+    w4a16_a4_prefill_enabled: bool = False,
+    w4a16_a4_prefill_terms: int = 1,
     decode_config: MoeDecodeConfig,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
@@ -8399,6 +8736,8 @@ def plan_tp_moe_arena_layout(
             route_num_experts=route_num_experts,
             w4a16_block_size_m=w4a16_block_size_m,
             w4a16_prefill_fused_sum=w4a16_prefill_fused_sum,
+            w4a16_a4_prefill_enabled=w4a16_a4_prefill_enabled,
+            w4a16_a4_prefill_terms=w4a16_a4_prefill_terms,
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
@@ -9025,6 +9364,8 @@ def _plan_tp_moe_arena_layout_from_caps(
         deterministic_output=deterministic_output,
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+        w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
+        w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
         decode_config=caps.decode_config,
     )
 
@@ -9085,6 +9426,8 @@ def plan_tp_moe_scratch(
         route_num_experts=caps.route_num_experts,
         w4a16_block_size_m=resolved_block_size_m,
         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+        w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
+        w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
         trellis_bits=caps.weight_plan.trellis_bits or 3,
         trellis_tile_config=caps.weight_plan.trellis_tile_config,
         trellis_pair_kinds=caps.weight_plan.trellis_pair_kinds,
@@ -9683,6 +10026,8 @@ def materialize_tp_moe_arena_workspaces(
             route_num_experts=caps.route_num_experts,
             w4a16_block_size_m=resolved_block_size_m,
             w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+            w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
+            w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
@@ -13351,9 +13696,15 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
         csf_inline = None
     if experts.mxfp4_csf is not None and csf_inline is None:
         experts.mxfp4_csf.decode(topk_ids, w1_blockscale, w2_blockscale)
+    # The A4 prefill path (when present) reads expanded (W4A16-layout) scales
+    # when its call is above the CSF stage limit (see _w4a16_reads_stage_scales);
+    # the MXFP4 prefill path reads the packed e8m0_k32 grids directly and also
+    # skips the stage-scale staging of the W4A16 fused launch.
     a4_launches = getattr(binding, "a4_prefill_launches", None)
-    stage_scales = experts.w4a16_expanded is not None and (
-        _w4a16_reads_stage_scales(binding.fused_launch, a4_launches)
+    stage_scales = (
+        experts.w4a16_expanded is not None
+        and getattr(binding, "mxfp4_prefill_launches", None) is None
+        and _w4a16_reads_stage_scales(binding.fused_launch, a4_launches)
     )
     csf_reset_barriers = (
         experts.nvfp4_csf is not None
@@ -13659,6 +14010,39 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 output=scatter_output,
                 launches=a4_launches,
             )
+        mxfp4_launches = getattr(binding, "mxfp4_prefill_launches", None)
+        if mxfp4_launches is not None:
+            # Default-OFF MXFP4 prefill.  Bind admitted this call (env threshold,
+            # packed e8m0_k32 layout, unit activation globals, scratch fit,
+            # plain routing).  Prefill-only: the threshold gate keeps decode-size
+            # calls on the W4A16 path.
+            from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
+                run_w4a16_mxfp4_prefill,
+            )
+
+            if os.environ.get("B12X_W4A16_MXFP4_PREFILL_TRACE", "") == "1":
+                logger.info(
+                    "B12X MXFP4 prefill dispatch: layer=%s tokens=%d topk=%d "
+                    "hidden=%d terms=%d",
+                    layer_idx,
+                    int(a.shape[0]),
+                    int(topk_ids.shape[1]),
+                    int(a.shape[1]),
+                    int(mxfp4_launches.terms),
+                )
+            return run_w4a16_mxfp4_prefill(
+                a,
+                prepared,
+                topk_weights,
+                topk_ids,
+                a1_gscale=a1_gscale,
+                a2_gscale=a2_gscale,
+                intermediate_cache13=intermediate_cache13,
+                intermediate_cache2=intermediate_cache2,
+                output=scatter_output,
+                launches=mxfp4_launches,
+                x4t_scales_expanded=binding.x4t_scales_expanded,
+            )
         result = run_w4a16_moe(
             a,
             prepared,
@@ -13711,6 +14095,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
                 if binding.route_pack_launches is not None
                 else plan.decode_config.w4a16_route_mode or "auto"
             ),
+            x4t_scales_expanded=binding.x4t_scales_expanded,
         )
         return _finalize_trellis_output(binding, result)
     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)

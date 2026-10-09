@@ -10,6 +10,7 @@ exception task offsets during loading.
 from __future__ import annotations
 
 import functools
+import os
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -22,6 +23,59 @@ from b12x._lib.program_cache import program_cache
 from b12x._lib.quant.x4t_scales import X4TScaleBatch
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+
+
+# HOST-CALL diagnostics for decode_x4t_packed_scale(_pair) invocations (one
+# increment per host call that issues the paired/single decode grid).
+# Codex review fix: this is NOT a GPU completion count -- it increments
+# BEFORE compiled(...) is invoked (including under CUDA-graph capture) and
+# does not increment on graph replay. Nothing on the serving path reads it;
+# it exists so tests and diagnostics can prove that a consumed scale
+# prefetch removed the corresponding inline decode HOST CALL. Gated behind
+# B12X_X4T_SCALE_LAUNCH_DIAGNOSTICS=1 (cached after the first check;
+# reset_packed_scale_host_call_count() re-reads it) so production calls pay
+# only a cached boolean test, not the instrumentation.
+_packed_scale_host_calls = 0
+_launch_diagnostics: bool | None = None
+
+
+def _launch_diagnostics_enabled() -> bool:
+    global _launch_diagnostics
+    if _launch_diagnostics is None:
+        _launch_diagnostics = (
+            os.environ.get("B12X_X4T_SCALE_LAUNCH_DIAGNOSTICS", "") == "1"
+        )
+    return _launch_diagnostics
+
+
+def packed_scale_host_call_count() -> int:
+    """Number of ``decode_x4t_packed_scale(_pair)`` HOST CALLS issued so far.
+
+    Host-call instrumentation, not GPU completions: an increment happens when
+    the host issues the launch (before the compiled callable runs, including
+    during CUDA-graph capture) and graph replays do not increment it. Zero
+    unless B12X_X4T_SCALE_LAUNCH_DIAGNOSTICS=1 was set (see
+    ``reset_packed_scale_host_call_count``).
+    """
+    return _packed_scale_host_calls
+
+
+def reset_packed_scale_host_call_count() -> None:
+    """Test hook: zero the host-call record and re-read the diagnostics gate.
+
+    Never called on the serving path. Tests that assert on the record must
+    call this AFTER setting B12X_X4T_SCALE_LAUNCH_DIAGNOSTICS=1.
+    """
+    global _packed_scale_host_calls, _launch_diagnostics
+    _packed_scale_host_calls = 0
+    _launch_diagnostics = None
+
+
+def _record_packed_scale_launch() -> None:
+    global _packed_scale_host_calls
+    if not _launch_diagnostics_enabled():
+        return
+    _packed_scale_host_calls += 1
 
 
 class _PackedScaleDecode:
@@ -505,6 +559,7 @@ def decode_x4t_packed_scales(
             expert_ids_sorted,
         )
     )
+    _record_packed_scale_launch()
     compiled(
         make_ptr(
             cutlass.Uint8,
@@ -634,6 +689,7 @@ def _launch_x4t_packed_scale_pair(
                 )
             )
     ids64 = expert_ids.dtype == torch.int64
+    _record_packed_scale_launch()
     program(
         *pointers,
         make_ptr(
