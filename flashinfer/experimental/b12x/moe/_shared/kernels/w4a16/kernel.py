@@ -9804,10 +9804,10 @@ def _small_m_direct_host_barrier_reset_enabled() -> bool:
 
     The micro-kernel barrier resets its arrival counter and advances its epoch
     before releasing the grid, so completed launches can safely reuse both
-    scalars.  Keep the historical host reset as the default while the
-    persistent-epoch path is evaluated independently and end-to-end.
+    scalars without host-side fills. Set the environment variable to ``1`` to
+    restore the redundant host reset for diagnostics.
     """
-    return os.environ.get("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "1") != "0"
+    return os.environ.get("B12X_W4A16_SMALL_M_HOST_BARRIER_RESET", "0") != "0"
 
 
 def _compile_w4a16_small_m_direct(
@@ -13058,6 +13058,7 @@ def run_w4a16_moe(
     rotation_a_up: torch.Tensor | None = None,
     route_mode: str = "auto",
     route_pack_launches=None,
+    x4t_scales_expanded: bool = False,
     stream: cuda.CUstream | None = None,
 ) -> torch.Tensor:
     activation = normalize_moe_activation(activation)
