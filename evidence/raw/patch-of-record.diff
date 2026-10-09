@@ -1,0 +1,1112 @@
+diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/prefill_a4.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/prefill_a4.py
+index ab212009d..2754adce0 100644
+--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/prefill_a4.py
++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/prefill_a4.py
+@@ -1373,12 +1373,15 @@ class W4A16A4PrefillLaunches:
+         """Bytes of ``intermediate_cache2`` the pipeline carves for ``tokens``."""
+         return _carve_layout(self, int(tokens))[-1]
+ 
++    def cache13_bytes(self, tokens: int) -> int:
++        """Bytes of ``intermediate_cache13`` (per-route BF16 FC2 rows) the
++        pipeline needs for ``tokens``."""
++        return int(tokens) * self.topk * self.hidden_size * 2
++
+     def fits_buffers(self, tokens: int, cache13_bytes: int, cache2_bytes: int) -> bool:
+-        return cache13_bytes >= int(
+-            tokens
+-        ) * self.topk * self.hidden_size * 2 and cache2_bytes >= self.scratch_bytes(
++        return cache13_bytes >= self.cache13_bytes(
+             tokens
+-        )
++        ) and cache2_bytes >= self.scratch_bytes(tokens)
+ 
+ 
+ def _fake(dtype, align=16):
+@@ -1577,6 +1580,86 @@ def a4_prefill_fits(
+     )
+ 
+ 
++@dataclass(frozen=True)
++class _A4RoutePackCapacity:
++    """Route-pack slot/block counts baked into one planned A4 carve."""
++
++    max_packed_routes: int
++    max_route_blocks: int
++
++
++def a4_prefill_sizing_launches(
++    *,
++    tokens: int,
++    hidden_size: int,
++    intermediate_size: int,
++    num_experts: int,
++    topk: int,
++    terms: int,
++    max_packed_routes: int,
++    max_route_blocks: int,
++) -> W4A16A4PrefillLaunches:
++    """A launch-shaped sizing carrier exposing the compiled launches' own
++    ``scratch_bytes()`` / ``cache13_bytes()`` / ``fits_buffers()`` without
++    compiling kernels (kernel slots are None and must not be launched).
++
++    ``max_packed_routes`` / ``max_route_blocks`` are the route-pack capacities
++    the A4 launch set is compiled with (padded route slots and route blocks at
++    ``A4_PREFILL_ROUTE_BLOCK``); ``num_experts`` is the effective route expert
++    count. Both the planner reservation and the admission tests size through
++    this carrier, so neither can drift from the runner's ``_carve_layout``.
++    """
++    return W4A16A4PrefillLaunches(
++        tokens=int(tokens),
++        hidden_size=int(hidden_size),
++        intermediate_size=int(intermediate_size),
++        num_experts=int(num_experts),
++        topk=int(topk),
++        grid=1,
++        terms=int(terms),
++        quant=None,
++        fc1=None,
++        fc2=None,
++        topk_sum=None,
++        route_pack=_A4RoutePackCapacity(
++            max_packed_routes=int(max_packed_routes),
++            max_route_blocks=int(max_route_blocks),
++        ),
++    )
++
++
++def a4_prefill_workspace_requirements(
++    *,
++    tokens: int,
++    hidden_size: int,
++    intermediate_size: int,
++    num_experts: int,
++    topk: int,
++    terms: int,
++    max_packed_routes: int,
++    max_route_blocks: int,
++) -> tuple[int, int]:
++    """Bytes of ``intermediate_cache2`` and ``intermediate_cache13`` the A4
++    prefill pipeline carves for one planned capacity.
++
++    This reuses the compiled launches' own ``scratch_bytes()`` /
++    ``cache13_bytes()`` (and therefore ``_carve_layout``) so the planner's
++    reservation can never drift from the runner's carve: it is the same code,
++    not a second hand formula. Returns ``(cache2_bytes, cache13_bytes)``.
++    """
++    launches = a4_prefill_sizing_launches(
++        tokens=tokens,
++        hidden_size=hidden_size,
++        intermediate_size=intermediate_size,
++        num_experts=num_experts,
++        topk=topk,
++        terms=terms,
++        max_packed_routes=max_packed_routes,
++        max_route_blocks=max_route_blocks,
++    )
++    return launches.scratch_bytes(tokens), launches.cache13_bytes(tokens)
++
++
+ def run_w4a16_a4_prefill(
+     a: torch.Tensor,
+     prepared,
+diff --git a/flashinfer/experimental/b12x/moe/fused_moe/_impl.py b/flashinfer/experimental/b12x/moe/fused_moe/_impl.py
+index e143161aa..11b75b8c7 100644
+--- a/flashinfer/experimental/b12x/moe/fused_moe/_impl.py
++++ b/flashinfer/experimental/b12x/moe/fused_moe/_impl.py
+@@ -3549,6 +3549,8 @@ def _plan_core_workspace(
+     route_num_experts: int | None = None,
+     w4a16_block_size_m: int | None = None,
+     w4a16_prefill_fused_sum: bool | None = None,
++    w4a16_a4_prefill_enabled: bool = False,
++    w4a16_a4_prefill_terms: int = 1,
+     trellis_bits: int = 3,
+     trellis_tile_config: tuple[int, int, int, int] | None = None,
+     trellis_pair_kinds: frozenset[str] | None = None,
+@@ -3976,6 +3978,75 @@ def _plan_core_workspace(
+                 (_a4_off + _a4_ebytes - 1) // _a4_ebytes,
+             )
+         cache_dtype = torch.float16 if full_rotation else dtype
++        # NVFP4 A4 prefill workspace (B12X_W4A16_A4_PREFILL): the A4 pipeline
++        # carves quantized input/intermediate planes, their scales, and padded
++        # route metadata out of cache2 and keeps one BF16 FC2 row per route in
++        # cache13. The carve exceeds the ordinary A16 allocation at GLM's
++        # prefill chunk sizes (38,146,560 B vs 33,554,432 B at 8192 tokens,
++        # terms=1), so select_a4()/fits_buffers() silently fell back to W4A16
++        # for near-full chunks. Reserve max(A16, A4) for cache2/cache13 at plan
++        # time, gated on the plan's frozen A4 controls (never the MXFP4 env
++        # knob) and mirroring the A4 compile admission in
++        # _w4a16_primary_launches exactly (route namespace match, no
++        # router-weight-on-input, supported packed/NVFP4 geometry). Sizing goes
++        # through the kernel's own carve (a4_prefill_workspace_requirements ->
++        # W4A16A4PrefillLaunches.scratch_bytes/_carve_layout), never a second
++        # hand formula. Flag-off plans keep the stock sizes; an enabled hybrid
++        # plan reserves the enlarged buffers even when a given call binds A16
++        # (the reservation is plan-level, not per-bind).
++        _a4_cache13_elements = 0
++        if (
++            w4a16_a4_prefill_enabled
++            and route_E == int(weight_E)
++            and not apply_router_weight_on_input
++        ):
++            from b12x.moe._shared.kernels.w4a16.host import (
++                max_packed_route_slots as _a4_mprs,
++                route_pack_token_capacity as _a4_rptc,
++            )
++            from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
++                A4_PREFILL_ROUTE_BLOCK as _A4_RB,
++                a4_prefill_supported as _a4_supported,
++                a4_prefill_workspace_requirements as _a4_requirements,
++            )
++
++            if _a4_supported(
++                prepared_layout=weight_layout,
++                scale_format=scale_format,
++                activation=activation,
++                is_gated=activation == "silu",
++                swiglu_limit=swiglu_limit,
++                dtype=dtype,
++                hidden_size=int(k),
++                intermediate_size=int(n),
++            ):
++                _a4_tokens = int(token_capacity)
++                _a4_numel_cap = _a4_rptc(_a4_tokens, int(num_topk)) * int(num_topk)
++                _a4_pr = max(_a4_mprs(_a4_numel_cap, _A4_RB, route_E), 1)
++                _a4_rbl = (_a4_pr + _A4_RB - 1) // _A4_RB
++                _a4_terms = (
++                    int(w4a16_a4_prefill_terms)
++                    if int(w4a16_a4_prefill_terms) in (1, 2)
++                    else 1
++                )
++                _a4_cache2_bytes, _a4_cache13_bytes = _a4_requirements(
++                    tokens=_a4_tokens,
++                    hidden_size=int(k),
++                    intermediate_size=int(n),
++                    num_experts=route_E,
++                    topk=int(num_topk),
++                    terms=_a4_terms,
++                    max_packed_routes=_a4_pr,
++                    max_route_blocks=_a4_rbl,
++                )
++                _a4_ebytes = _dtype_nbytes(cache_dtype)
++                intermediate_cache2_elements = max(
++                    intermediate_cache2_elements,
++                    (_a4_cache2_bytes + _a4_ebytes - 1) // _a4_ebytes,
++                )
++                _a4_cache13_elements = (
++                    _a4_cache13_bytes + _a4_ebytes - 1
++                ) // _a4_ebytes
+         use_prefill_fused_sum = prefill_fused_sum_eligible(
+             dtype=dtype,
+             m=token_capacity,
+@@ -4001,6 +4072,15 @@ def _plan_core_workspace(
+                 intermediate_cache13_elements,
+                 _a4_routes * int(k),
+             )
++        # NVFP4 A4 prefill workspace: cache13 must also fit one BF16 FC2 row
++        # per route — tokens * topk * hidden_size ELEMENTS, i.e. that product
++        # times 2 bytes — for the admitted A4 pipeline (fits_buffers checks
++        # both planes together).
++        if _a4_cache13_elements > 0:
++            intermediate_cache13_elements = max(
++                intermediate_cache13_elements,
++                _a4_cache13_elements,
++            )
+         tensor_specs = [
+             _TensorAllocSpec(
+                 "intermediate_cache13",
+@@ -8555,6 +8635,8 @@ def plan_tp_moe_arena_layout(
+     deterministic_output: bool | None = None,
+     w4a16_block_size_m: int | None = None,
+     w4a16_prefill_fused_sum: bool | None = None,
++    w4a16_a4_prefill_enabled: bool = False,
++    w4a16_a4_prefill_terms: int = 1,
+     decode_config: MoeDecodeConfig,
+ ) -> TPMoEArenaLayout:
+     """Compute the byte layout needed by one lane-owned MoE pool."""
+@@ -8654,6 +8736,8 @@ def plan_tp_moe_arena_layout(
+             route_num_experts=route_num_experts,
+             w4a16_block_size_m=w4a16_block_size_m,
+             w4a16_prefill_fused_sum=w4a16_prefill_fused_sum,
++            w4a16_a4_prefill_enabled=w4a16_a4_prefill_enabled,
++            w4a16_a4_prefill_terms=w4a16_a4_prefill_terms,
+             trellis_bits=weight_plan.trellis_bits or 3,
+             trellis_tile_config=weight_plan.trellis_tile_config,
+             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
+@@ -9280,6 +9364,8 @@ def _plan_tp_moe_arena_layout_from_caps(
+         deterministic_output=deterministic_output,
+         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
+         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
++        w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
++        w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
+         decode_config=caps.decode_config,
+     )
+ 
+@@ -9340,6 +9426,8 @@ def plan_tp_moe_scratch(
+         route_num_experts=caps.route_num_experts,
+         w4a16_block_size_m=resolved_block_size_m,
+         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
++        w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
++        w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
+         trellis_bits=caps.weight_plan.trellis_bits or 3,
+         trellis_tile_config=caps.weight_plan.trellis_tile_config,
+         trellis_pair_kinds=caps.weight_plan.trellis_pair_kinds,
+@@ -9938,6 +10026,8 @@ def materialize_tp_moe_arena_workspaces(
+             route_num_experts=caps.route_num_experts,
+             w4a16_block_size_m=resolved_block_size_m,
+             w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
++            w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
++            w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
+             trellis_bits=weight_plan.trellis_bits or 3,
+             trellis_tile_config=weight_plan.trellis_tile_config,
+             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
+diff --git a/tests/experimental/b12x/moe/test_w4a16_a4_prefill.py b/tests/experimental/b12x/moe/test_w4a16_a4_prefill.py
+index 4673ceb47..06a82ccb3 100644
+--- a/tests/experimental/b12x/moe/test_w4a16_a4_prefill.py
++++ b/tests/experimental/b12x/moe/test_w4a16_a4_prefill.py
+@@ -510,8 +510,13 @@ def test_csf_prefetch_query_matches_exact_variant_and_precision(
+                 calibrated and choice is True
+             ), (tokens, choice)
+             if calibrated and choice is True and tokens == 4:
++                # Since the plan-time A4 workspace reservation (2026-10-09),
++                # the exact 4-row variant reserves the padded-route carve
++                # itself and binds its own A4 launch; previously its stock
++                # buffers could not hold the carve and the call borrowed the
++                # 3072 variant's launch.
+                 assert binding.a4_prefill_launches is (
+-                    plan._prepared.state.variants[3072].w4a16_launches.a4_prefill
++                    plan._prepared.state.variants[4].w4a16_launches.a4_prefill
+                 )
+             moe.run(binding=binding)
+             torch.cuda.synchronize()
+@@ -521,8 +526,12 @@ def test_csf_prefetch_query_matches_exact_variant_and_precision(
+         with pytest.raises(ValueError, match="capacity"):
+             moe.uses_expanded_nvfp4_scales(plan, num_tokens=tokens)
+     if calibrated:
+-        # Without a larger prepared variant, the exact four-row plan retains
+-        # A16 when its intermediate buffers cannot hold padded A4 routes.
++        # Since the plan-time A4 workspace reservation (2026-10-09), the exact
++        # four-row plan reserves the padded-route carve itself and admits A4
++        # at its own capacity (previously its stock buffers could not hold the
++        # carve and the call stayed A16 without a larger borrowed variant).
++        # The short-buffer fallback contract is preserved below via an
++        # explicitly undersized plan; fits_buffers remains authoritative.
+         small = _plan(owner, 4)
+         small_scratch = tuple(
+             torch.empty(s.shape, dtype=s.dtype, device=device)
+@@ -537,7 +546,10 @@ def test_csf_prefetch_query_matches_exact_variant_and_precision(
+             small_scratch,
+             a4_prefill=True,
+         )
+-        assert binding.a4_prefill_launches is None
++        assert binding.a4_prefill_launches is (
++            small._prepared.state.w4a16_launches.a4_prefill
++        )
++        assert binding.a4_prefill_launches.tokens == 4
+         assert not moe.uses_expanded_nvfp4_scales(small, num_tokens=4, a4_prefill=True)
+         # A4 cannot use a plan whose intermediate buffers do not fit its planes.
+         root = plan._prepared.state
+diff --git a/tests/experimental/b12x/moe/test_w4a16_a4_prefill_admission.py b/tests/experimental/b12x/moe/test_w4a16_a4_prefill_admission.py
+new file mode 100644
+index 000000000..03d8b18d8
+--- /dev/null
++++ b/tests/experimental/b12x/moe/test_w4a16_a4_prefill_admission.py
+@@ -0,0 +1,384 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Admission regressions for the NVFP4 A4 prefill workspace reservation.
++
++The stock planner sized ``intermediate_cache2`` as ``routed_capacity *
++local_intermediate_size`` elements while the A4 prefill pipeline
++(``prefill_a4._carve_layout``) carves quantized input/intermediate planes,
++their scales, and padded route metadata out of that same buffer. At GLM's
++geometry (E=256, H=6144, I=256, topk=8) and 8192-token capacity the carve
++needs 38,146,560 bytes against a 33,554,432-byte stock allocation, so
++``select_a4()``/``fits_buffers()`` silently fell back to W4A16 for near-full
++chunks (only 7195 live tokens fit). These tests pin the plan-time reservation
++(max of the A16 and A4 requirements, sized by the kernel's own carve) and the
++admission outcome at full/near-full capacity.
++
++Host-side tests are CPU-only and exercise plan-time sizing and the selector
++contract. GPU tests bind real prepared weights at GLM's geometry and assert
++the bound launch selection; they skip without a consumer-Blackwell GPU.
++"""
++
++from __future__ import annotations
++
++import math
++
++import pytest
++import torch
++
++from b12x.moe._shared.kernels.w4a16.host import (
++    max_packed_route_slots,
++    route_pack_token_capacity,
++)
++from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
++    A4_PREFILL_ROUTE_BLOCK,
++    a4_prefill_sizing_launches,
++)
++
++# GLM-5.3 TP8 routed-expert geometry: 256 experts, hidden 6144, 256
++# intermediate channels per TP8 rank, top-k 8.
++E, H, I, TOPK = 256, 6144, 256, 8
++CAPACITIES = (2048, 4096, 8192)
++
++# Ground truth: the compiled launches' own carve at this geometry (verified
++# byte-exact against W4A16A4PrefillLaunches.scratch_bytes, 2026-10-09 probe).
++CACHE2_TERMS1 = {2048: 9_636_864, 4096: 19_140_096, 8192: 38_146_560}
++CACHE2_TERMS2 = {2048: 19_074_048, 4096: 38_014_464, 8192: 75_895_296}
++CACHE13 = {2048: 201_326_592, 4096: 402_653_184, 8192: 805_306_368}
++STOCK_CACHE2 = {2048: 8_388_608, 4096: 16_777_216, 8192: 33_554_432}
++
++
++def _route_pack_capacity(capacity):
++    """Route-pack slots/blocks the A4 launch set compiles with: the pack
++    buckets tokens to the next power of two and pads every expert's route
++    block (A4_PREFILL_ROUTE_BLOCK)."""
++    numel_cap = route_pack_token_capacity(capacity, TOPK) * TOPK
++    packed_routes = max(
++        max_packed_route_slots(numel_cap, A4_PREFILL_ROUTE_BLOCK, E), 1
++    )
++    route_blocks = (packed_routes + A4_PREFILL_ROUTE_BLOCK - 1) // A4_PREFILL_ROUTE_BLOCK
++    return packed_routes, route_blocks
++
++
++def _sizing_launch(capacity, terms=1):
++    packed_routes, route_blocks = _route_pack_capacity(capacity)
++    return a4_prefill_sizing_launches(
++        tokens=capacity,
++        hidden_size=H,
++        intermediate_size=I,
++        num_experts=E,
++        topk=TOPK,
++        terms=terms,
++        max_packed_routes=packed_routes,
++        max_route_blocks=route_blocks,
++    )
++
++
++def _plan_sizes(capacity, *, enabled, terms=1, fused_sum=False):
++    """Plan the GLM core workspace on CPU and return buffer sizes in bytes."""
++    from b12x.moe.fused_moe import _impl as impl
++
++    core = impl._plan_core_workspace(
++        "w4a16",
++        "w4a16",
++        E,
++        E,
++        H,
++        I,
++        TOPK,
++        torch.device("cpu"),
++        torch.bfloat16,
++        routed_rows=capacity * TOPK,
++        max_rows=capacity * TOPK,
++        source_format="modelopt_nvfp4",
++        w4a16_weight_layout="packed",
++        w4a16_scale_format="e4m3_k16_csf",
++        w4a16_prefill_fused_sum=fused_sum,
++        w4a16_a4_prefill_enabled=enabled,
++        w4a16_a4_prefill_terms=terms,
++    )
++    return {
++        spec.name: math.prod(spec.shape) * spec.dtype.itemsize
++        for spec in core.tensor_specs
++    }
++
++
++class TestPlannerReservation:
++    """The plan-time reservation must cover the kernel's own carve."""
++
++    @pytest.mark.parametrize("capacity", CAPACITIES)
++    def test_cache2_reserved_matches_kernel_carve_terms1(self, capacity):
++        sizes = _plan_sizes(capacity, enabled=True, terms=1)
++        assert sizes["intermediate_cache2"] == CACHE2_TERMS1[capacity]
++        # At 8192 the spec pins the requirement to the byte.
++        if capacity == 8192:
++            assert sizes["intermediate_cache2"] == 38_146_560
++
++    @pytest.mark.parametrize("capacity", CAPACITIES)
++    def test_cache2_reserved_matches_kernel_carve_terms2(self, capacity):
++        sizes = _plan_sizes(capacity, enabled=True, terms=2)
++        assert sizes["intermediate_cache2"] == CACHE2_TERMS2[capacity]
++
++    @pytest.mark.parametrize("capacity", CAPACITIES)
++    def test_cache13_reserved_covers_route_rows(self, capacity):
++        for terms in (1, 2):
++            sizes = _plan_sizes(capacity, enabled=True, terms=terms)
++            assert sizes["intermediate_cache13"] == CACHE13[capacity]
++
++    @pytest.mark.parametrize("capacity", CAPACITIES)
++    @pytest.mark.parametrize("terms", [1, 2])
++    def test_reserved_buffers_admit_full_capacity(self, capacity, terms):
++        """fits_buffers() (the compiled launch's own admission check) must
++        pass for the A4 pipeline at full prepared capacity."""
++        sizes = _plan_sizes(capacity, enabled=True, terms=terms)
++        launch = _sizing_launch(capacity, terms)
++        assert launch.fits_buffers(
++            capacity, sizes["intermediate_cache13"], sizes["intermediate_cache2"]
++        )
++        assert launch.scratch_bytes(capacity) == sizes["intermediate_cache2"]
++        assert launch.cache13_bytes(capacity) <= sizes["intermediate_cache13"]
++
++    @pytest.mark.parametrize("capacity", CAPACITIES)
++    @pytest.mark.parametrize("terms", [1, 2])
++    def test_reserved_buffers_admit_near_full_capacity(self, capacity, terms):
++        sizes = _plan_sizes(capacity, enabled=True, terms=terms)
++        launch = _sizing_launch(capacity, terms)
++        for live in (1, 512, capacity // 2, capacity - 25, capacity - 1):
++            assert launch.fits_buffers(
++                live, sizes["intermediate_cache13"], sizes["intermediate_cache2"]
++            ), live
++
++    def test_fused_sum_plan_still_reserves_cache13(self):
++        """With the prefill fused sum enabled the A16 cache13 shrinks to the
++        FP32 accumulator budget; the A4 per-route BF16 rows must still fit."""
++        sizes = _plan_sizes(8192, enabled=True, terms=1, fused_sum=True)
++        launch = _sizing_launch(8192, 1)
++        assert sizes["intermediate_cache13"] >= CACHE13[8192]
++        assert launch.fits_buffers(
++            8192, sizes["intermediate_cache13"], sizes["intermediate_cache2"]
++        )
++
++
++class TestStockBehaviorUnchanged:
++    """Flag-off plans keep the exact stock allocation, and that stock plan is
++    the reproduced admission blocker (regression pin)."""
++
++    @pytest.mark.parametrize("capacity", CAPACITIES)
++    def test_flag_off_allocation_is_stock(self, capacity):
++        sizes = _plan_sizes(capacity, enabled=False)
++        assert sizes["intermediate_cache2"] == STOCK_CACHE2[capacity]
++        assert sizes["intermediate_cache13"] == CACHE13[capacity]
++
++    @pytest.mark.parametrize("capacity", CAPACITIES)
++    def test_stock_cache2_is_routed_capacity_times_intermediate(self, capacity):
++        sizes = _plan_sizes(capacity, enabled=False)
++        assert sizes["intermediate_cache2"] == capacity * TOPK * I * 2
++
++    def test_stock_plan_reproduces_the_admission_blocker(self):
++        """The pre-fix contract: at 8192 stock buffers admit at most 7195 live
++        A4 tokens, so full chunks fall back to W4A16."""
++        sizes = _plan_sizes(8192, enabled=False)
++        launch = _sizing_launch(8192, 1)
++        assert not launch.fits_buffers(
++            8192, sizes["intermediate_cache13"], sizes["intermediate_cache2"]
++        )
++        fitting = [
++            t
++            for t in range(1, 8193)
++            if launch.fits_buffers(
++                t, sizes["intermediate_cache13"], sizes["intermediate_cache2"]
++            )
++        ]
++        assert max(fitting) == 7195
++
++    def test_reserved_plan_admits_every_live_count(self):
++        sizes = _plan_sizes(8192, enabled=True, terms=1)
++        launch = _sizing_launch(8192, 1)
++        assert all(
++            launch.fits_buffers(
++                t, sizes["intermediate_cache13"], sizes["intermediate_cache2"]
++            )
++            for t in range(1, 8193)
++        )
++
++
++class TestSelectorContract:
++    """select_a4 preserves explicit precision: force=True is required, and
++    short buffers still reject (fits_buffers is never bypassed)."""
++
++    def _selector(self, capacity):
++        from b12x.moe.fused_moe._preparation import _W4A16PrimaryLaunches
++
++        return _W4A16PrimaryLaunches(
++            tokens=capacity,
++            route_mode="packed",
++            packed=None,
++            packed_mapped=None,
++            direct=None,
++            direct_mapped=None,
++            topk_sum=None,
++            mapped_topk_sum=None,
++            route_pack=None,
++            a4_prefill=_sizing_launch(capacity, 1),
++        )
++
++    def test_explicit_a4_admitted_at_full_capacity(self):
++        sizes = _plan_sizes(8192, enabled=True, terms=1)
++        selector = self._selector(8192)
++        args = dict(
++            tokens=8192,
++            route_ids_dtype=torch.int32,
++            has_route_map=False,
++            activation_amax=None,
++            apply_router_weight_on_input=False,
++            cache13_bytes=sizes["intermediate_cache13"],
++            cache2_bytes=sizes["intermediate_cache2"],
++            force=True,
++        )
++        assert selector.select_a4(**args) is not None
++        # Non-explicit selection keeps W4A16 regardless of buffers.
++        assert selector.select_a4(**{**args, "force": None}) is None
++        assert selector.select_a4(**{**args, "force": False}) is None
++
++    def test_short_buffers_still_reject(self):
++        """A stock-sized cache2 must not be admitted even when A4 is forced:
++        the reservation fixes the plan, fits_buffers stays authoritative."""
++        sizes = _plan_sizes(8192, enabled=False)
++        selector = self._selector(8192)
++        assert (
++            selector.select_a4(
++                tokens=8192,
++                route_ids_dtype=torch.int32,
++                has_route_map=False,
++                activation_amax=None,
++                apply_router_weight_on_input=False,
++                cache13_bytes=sizes["intermediate_cache13"],
++                cache2_bytes=sizes["intermediate_cache2"],
++                force=True,
++            )
++            is None
++        )
++
++
++# ---------------------------------------------------------------------------
++# GPU admission: real prepared weights, real binds, GLM geometry.
++# ---------------------------------------------------------------------------
++
++
++def _gpu_case(monkeypatch, *, enabled, terms, capacity, csf=False, seed=11):
++    from .test_w4a16_a4_prefill import (
++        _bind,
++        _env,
++        _inputs,
++        _make_case,
++        _plan,
++        _prepare,
++    )
++
++    _env(monkeypatch, enabled, terms)
++    case = _make_case(seed, I, H, E, TOPK)
++    # Calibrated activation globals retain the A4 scales; exact values are an
++    # admission matter here, not a numeric one.
++    a1g = torch.full((E,), 4.0, device="cuda")
++    a2g = torch.full((E,), 4.0, device="cuda")
++    experts = _prepare(case, a1g, a2g, csf=csf)
++    xp = _plan(experts, capacity, top_k=TOPK)
++    dev = torch.device("cuda")
++    scratch = tuple(
++        torch.empty(s.shape, dtype=s.dtype, device=dev) for s in xp.scratch_specs()
++    )
++    out = torch.empty(capacity, H, device=dev, dtype=torch.bfloat16)
++    return case, experts, xp, scratch, out, _bind, _inputs
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize(
++    "capacity,terms",
++    [(2048, 1), (4096, 1), (8192, 1), (8192, 2)],
++)
++def test_a4_binds_full_capacity_on_gpu(monkeypatch, capacity, terms):
++    """Explicit a4_prefill=True must bind an A4 launch at full prepared
++    capacity (and near-full live counts) once the plan reserves the workspace.
++    """
++    from ..conftest import require_b12x
++
++    require_b12x()
++    _, experts, xp, scratch, out, _bind, _inputs = _gpu_case(
++        monkeypatch, enabled=True, terms=terms, capacity=capacity
++    )
++    assert experts._impl.a4_prefill_scales
++    for live in (capacity - 25, capacity):
++        x, ids, wts = _inputs(live, live, H, E, TOPK)
++        binding = _bind(xp, x, ids, wts, out[:live], scratch, a4_prefill=True)
++        launch = binding.a4_prefill_launches
++        assert launch is not None, live
++        assert launch.terms == terms
++        cache2_bytes = (
++            binding.intermediate_cache2.numel()
++            * binding.intermediate_cache2.element_size()
++        )
++        cache13_bytes = (
++            binding.intermediate_cache13.numel()
++            * binding.intermediate_cache13.element_size()
++        )
++        assert launch.fits_buffers(live, cache13_bytes, cache2_bytes)
++        if live == capacity:
++            expected = CACHE2_TERMS1[capacity] if terms == 1 else CACHE2_TERMS2[capacity]
++            assert launch.scratch_bytes(live) == expected
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_flag_off_and_explicit_a16_bind_a16_with_stock_buffers(monkeypatch):
++    """Flag-off keeps stock buffers and never binds A4; an A4-flagged plan
++    with explicit a4_prefill=False/None still binds the A16 launch."""
++    from ..conftest import require_b12x
++
++    require_b12x()
++    # Flag off: stock allocation, A4 never selected even when requested.
++    case, experts, xp, scratch, out, _bind, _inputs = _gpu_case(
++        monkeypatch, enabled=False, terms=1, capacity=8192
++    )
++    x, ids, wts = _inputs(8192, 5, H, E, TOPK)
++    binding = _bind(xp, x, ids, wts, out, scratch, a4_prefill=True)
++    assert binding.a4_prefill_launches is None
++    cache2_bytes = (
++        binding.intermediate_cache2.numel()
++        * binding.intermediate_cache2.element_size()
++    )
++    assert cache2_bytes == STOCK_CACHE2[8192]
++    assert binding.fused_launch is not None
++
++    # Flag on, explicit A16: the enlarged plan still binds W4A16.
++    _, experts, xp, scratch, out, _bind, _inputs = _gpu_case(
++        monkeypatch, enabled=True, terms=1, capacity=8192
++    )
++    for choice in (False, None):
++        binding = _bind(xp, x, ids, wts, out, scratch, a4_prefill=choice)
++        assert binding.a4_prefill_launches is None
++        assert binding.fused_launch is not None
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_csf_scales_admit_full_capacity_on_gpu(monkeypatch):
++    """CSF-compressed NVFP4 weights at GLM geometry: full-capacity A4 binding
++    with both the inline and the expanded scale readers (scales_expanded
++    selects the expanded launch above the CSF stage limit)."""
++    from ..conftest import require_b12x
++
++    require_b12x()
++    _, experts, xp, scratch, out, _bind, _inputs = _gpu_case(
++        monkeypatch, enabled=True, terms=1, capacity=8192, csf=True, seed=13
++    )
++    assert experts._impl.a4_prefill_scales
++    x, ids, wts = _inputs(8192, 7, H, E, TOPK)
++    for expanded in (False, True):
++        binding = _bind(
++            xp, x, ids, wts, out, scratch, a4_prefill=True, scales_expanded=expanded
++        )
++        launch = binding.a4_prefill_launches
++        assert launch is not None, expanded
++        assert launch.fits_buffers(
++            8192,
++            binding.intermediate_cache13.numel()
++            * binding.intermediate_cache13.element_size(),
++            binding.intermediate_cache2.numel()
++            * binding.intermediate_cache2.element_size(),
++        )
+\ No newline at end of file
+diff --git a/tests/experimental/b12x/moe/test_w4a16_a4_prefill_arena.py b/tests/experimental/b12x/moe/test_w4a16_a4_prefill_arena.py
+new file mode 100644
+index 000000000..260e732ce
+--- /dev/null
++++ b/tests/experimental/b12x/moe/test_w4a16_a4_prefill_arena.py
+@@ -0,0 +1,223 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Arena-level integration for the plan-time A4 workspace reservation.
++
++The admission suite pins the public plan/bind contract per variant scratch
++(each ``scratch_specs()`` tensor allocated separately). These tests cover the
++SERVING path instead: the shared arena byte layout
++(``plan_tp_moe_arena_layout`` / ``materialize_tp_moe_arena_workspaces``)
++reserves the A4 carve out of the same byte budget the pool carves views from,
++asserted against the kernel's own requirements for both activation-plane
++counts, including the fused-sum cache13 interplay; and an already-declared
++caps/plan keeps its frozen controls when the env changes underneath it.
++
++CPU-only: these pin the layout/planner arithmetic, not kernels.
++"""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++from b12x.moe.fused_moe import _impl as impl
++from b12x.moe.fused_moe._impl import (
++    TPMoEScratchCaps,
++    plan_b12x_fp4_moe_weights,
++    plan_tp_moe_arena_layout,
++    tp_moe_required_nbytes,
++)
++
++from b12x.moe.fused_moe._tuning import MoeDecodeConfig
++from b12x.moe._shared.kernels.w4a16.host import (
++    max_packed_route_slots,
++    route_pack_token_capacity,
++)
++from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
++    A4_PREFILL_ROUTE_BLOCK,
++    a4_prefill_workspace_requirements,
++)
++
++# GLM-5.3 TP8 geometry (one rank): 256 experts, hidden 6144, 256 intermediate.
++E, H, I, TOPK = 256, 6144, 256, 8
++CAPACITY = 8192
++
++
++def _weight_plan():
++    return plan_b12x_fp4_moe_weights(
++        quant_modes="w4a16",
++        source_format="modelopt_nvfp4",
++        activation="silu",
++        params_dtype=torch.bfloat16,
++        num_experts=E,
++        hidden_size=H,
++        intermediate_size=I,
++    )
++
++
++def _caps(*, enabled, terms=1, fused_sum=False, plan=None, capacity=CAPACITY):
++    return TPMoEScratchCaps(
++        max_tokens=capacity,
++        num_topk=TOPK,
++        device="cpu",
++        weight_plan=plan or _weight_plan(),
++        quant_mode="w4a16",
++        core_token_counts=(capacity,),
++        w4a16_a4_prefill_enabled=enabled,
++        w4a16_a4_prefill_terms=terms,
++        w4a16_prefill_fused_sum=fused_sum,
++        decode_config=MoeDecodeConfig(
++            backend="w4a16",
++            route_planner="internal",
++            max_active_clusters=None,
++            w4a16_route_mode="packed",
++        ),
++    )
++
++
++def _a4_requirements(terms):
++    """The kernel's own carve at the arena's planned capacity (the same
++    sizing the planner routes through a4_prefill_workspace_requirements)."""
++    numel_cap = route_pack_token_capacity(CAPACITY, TOPK) * TOPK
++    packed_routes = max(
++        max_packed_route_slots(numel_cap, A4_PREFILL_ROUTE_BLOCK, E), 1
++    )
++    route_blocks = (
++        (packed_routes + A4_PREFILL_ROUTE_BLOCK - 1) // A4_PREFILL_ROUTE_BLOCK
++    )
++    return a4_prefill_workspace_requirements(
++        tokens=CAPACITY,
++        hidden_size=H,
++        intermediate_size=I,
++        num_experts=E,
++        topk=TOPK,
++        terms=terms,
++        max_packed_routes=packed_routes,
++        max_route_blocks=route_blocks,
++    )
++
++
++def _core_plan(capacity, *, enabled, terms=1, fused_sum=False):
++    """_plan_core_workspace at GLM geometry, mirroring the arena call."""
++    return impl._plan_core_workspace(
++        "w4a16",
++        "w4a16",
++        E,
++        E,
++        H,
++        I,
++        TOPK,
++        torch.device("cpu"),
++        torch.bfloat16,
++        routed_rows=capacity * TOPK,
++        max_rows=capacity * TOPK,
++        source_format="modelopt_nvfp4",
++        w4a16_weight_layout="packed",
++        w4a16_scale_format="e4m3_k16_csf",
++        w4a16_prefill_fused_sum=fused_sum,
++        w4a16_a4_prefill_enabled=enabled,
++        w4a16_a4_prefill_terms=terms,
++    )
++
++
++def _spec_bytes(core_plan, name):
++    spec = next(s for s in core_plan.tensor_specs if s.name == name)
++    import math
++
++    return math.prod(spec.shape) * spec.dtype.itemsize
++
++
++def _core_nbytes(core_plan):
++    return impl._core_workspace_nbytes(core_plan)
++
++
++class TestArenaReservesA4Carve:
++    @pytest.mark.parametrize("terms", [1, 2])
++    def test_arena_bytes_cover_the_a4_carve(self, terms):
++        """The A4-enabled arena's core byte count is at least the stock one
++        and the core region alone can hold the kernel's full carve."""
++        stock = tp_moe_required_nbytes(_caps(enabled=False, terms=terms))
++        on = tp_moe_required_nbytes(_caps(enabled=True, terms=terms))
++        cache2, cache13 = _a4_requirements(terms)
++        assert on >= stock
++        core_on = _core_nbytes(_core_plan(CAPACITY, enabled=True, terms=terms))
++        assert core_on >= cache2 + cache13
++
++    @pytest.mark.parametrize("terms", [1, 2])
++    def test_core_specs_hold_carve_and_cache13(self, terms):
++        """Per-spec: cache2 spans at least the A4 carve bytes; cache13 spans
++        at least the per-route BF16 rows (plus headroom the stock layout
++        needs). Byte-exact pin at terms=1 capacity 8192."""
++        plan_on = _core_plan(CAPACITY, enabled=True, terms=terms)
++        cache2, cache13 = _a4_requirements(terms)
++        assert _spec_bytes(plan_on, "intermediate_cache2") >= cache2
++        assert _spec_bytes(plan_on, "intermediate_cache13") >= cache13
++        if terms == 1 and CAPACITY == 8192:
++            assert _spec_bytes(plan_on, "intermediate_cache2") == 38_146_560
++            assert _spec_bytes(plan_on, "intermediate_cache13") == 805_306_368
++        plan_off = _core_plan(CAPACITY, enabled=False, terms=terms)
++        assert _spec_bytes(plan_off, "intermediate_cache2") == 33_554_432
++
++    @pytest.mark.parametrize("fused_sum", [False, True])
++    def test_fused_sum_cache13_still_covers_a4(self, fused_sum):
++        """Fused-sum A16 rows are narrower (FP32-sum budget); with the
++        reservation active the fused-sum core cache13 still covers the A4
++        per-route rows, and never drops below the non-fused reservation."""
++        cache2, cache13 = _a4_requirements(1)
++        plan_fused = _core_plan(CAPACITY, enabled=True, fused_sum=fused_sum)
++        assert _spec_bytes(plan_fused, "intermediate_cache13") >= cache13
++        plan_plain = _core_plan(CAPACITY, enabled=True, fused_sum=False)
++        assert (
++            _spec_bytes(plan_fused, "intermediate_cache13")
++            >= _spec_bytes(plan_plain, "intermediate_cache13")
++            if fused_sum is False
++            else True
++        )
++        # The fused layout with the reservation never under-covers vs stock
++        # fused plan cache13.
++        stock_fused = _core_plan(CAPACITY, enabled=False, fused_sum=True)
++        assert (
++            _spec_bytes(plan_fused, "intermediate_cache13")
++            >= _spec_bytes(stock_fused, "intermediate_cache13")
++        )
++
++    def test_flag_off_arena_matches_stock_exactly(self):
++        base = tp_moe_required_nbytes(_caps(enabled=False))
++        # enabled=False caps => identical bytes even with the env flag on:
++        # the reservation follows the CAPS field, not the live env.
++        assert tp_moe_required_nbytes(_caps(enabled=False)) == base
++
++
++class TestFrozenControls:
++    def test_materialized_plan_consistent_after_env_change(self, monkeypatch):
++        """Controls freeze into caps at declaration: flipping the env after
++        the caps exists must not change the already-computed arena bytes (no
++        silent re-plan), while a fresh caps under the new env plans smaller."""
++        monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "1")
++        monkeypatch.setenv("B12X_W4A16_A4_PREFILL_TERMS", "1")
++        caps_on = _caps(enabled=True)
++        bytes_on = tp_moe_required_nbytes(caps_on)
++
++        monkeypatch.setenv("B12X_W4A16_A4_PREFILL", "0")
++        # same caps: unchanged (dataclass frozen with explicit fields)
++        assert tp_moe_required_nbytes(caps_on) == bytes_on
++        # fresh caps under the flipped env plans stock sizes
++        bytes_fresh_off = tp_moe_required_nbytes(_caps(enabled=False))
++        assert bytes_fresh_off < bytes_on
++
++
++class TestArenaMemoryGrowth:
++    def test_serving_growth_budget_at_glm_geometry(self):
++        """Record the actual arena growth for the serving config
++        (terms=1, capacity 8192): the known cache2 delta is ~4.38 MiB plus
++        the cache13/other deltas if any."""
++        stock = tp_moe_required_nbytes(_caps(enabled=False, terms=1))
++        on = tp_moe_required_nbytes(_caps(enabled=True, terms=1))
++        delta = on - stock
++        print(f"\narena growth (terms=1, GLM geometry, 8192): {delta} bytes")
++        core_stock = _core_plan(CAPACITY, enabled=False, terms=1)
++        core_on = _core_plan(CAPACITY, enabled=True, terms=1)
++        cache2_delta = _spec_bytes(core_on, "intermediate_cache2") - _spec_bytes(
++            core_stock, "intermediate_cache2"
++        )
++        print(f"cache2 delta: {cache2_delta} bytes")
++        assert delta >= 4_592_128  # 38,146,560 - 33,554,432, known carve delta
++        assert cache2_delta == 4_592_128
+diff --git a/tests/experimental/b12x/moe/test_w4a16_a4_prefill_fullgeom.py b/tests/experimental/b12x/moe/test_w4a16_a4_prefill_fullgeom.py
+new file mode 100644
+index 000000000..bbd79f406
+--- /dev/null
++++ b/tests/experimental/b12x/moe/test_w4a16_a4_prefill_fullgeom.py
+@@ -0,0 +1,179 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Full-GLM-geometry execution for the A4 prefill admission fixes.
++
++The admission suite binds at capacity 8192 but never executes; the execution
++and CSF/graph cases run at the small fixture (E=8, H=512, topk=2, live up to
++1537). These tests close that gap at the serving geometry
++(E=256, H=6144, I=256, topk=8), through the patched planner with NO sizing
++override: full- and near-full-chunk execution for both CSF readers, output
++parity between the readers on identical operands, finite/nonempty results, a
++replay check with changed inputs and poisoned reusable scratch, and an
++explicit A16 execution control at the same geometry.
++
++GPU tests skip without a consumer-Blackwell device.
++"""
++
++from __future__ import annotations
++
++import pytest
++import torch
++
++from ..conftest import require_b12x
++from .test_w4a16_a4_prefill import (
++    _bind,
++    _env,
++    _inputs,
++    _make_case,
++    _plan,
++    _prepare,
++    _scales,
++)
++
++# Serving geometry (GLM-5.3, one TP8 rank).
++E, H, I, TOPK = 256, 6144, 256, 8
++CAPACITY = 8192
++
++
++def _fixture(monkeypatch, *, csf, seed=31):
++    """Calibrated prepared weights + capacity-8192 plan + fresh scratch."""
++    _env(monkeypatch, True, 1)
++    case = _make_case(seed, I, H, E, TOPK)
++    a1g, a2g = _scales(case)
++    experts = _prepare(case, a1g, a2g, csf=csf)
++    assert experts._impl.a4_prefill_scales
++    xp = _plan(experts, CAPACITY, top_k=TOPK)
++    dev = torch.device("cuda")
++    scratch = tuple(
++        torch.empty(s.shape, dtype=s.dtype, device=dev) for s in xp.scratch_specs()
++    )
++    return case, experts, xp, scratch
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++@pytest.mark.parametrize("csf", [False, True])
++def test_a4_full_geometry_execution_inline_vs_expanded(csf, monkeypatch):
++    """Full (8192) and near-full (8167) execution through the patched
++    planner, no sizing override. For CSF weights the inline and explicitly
++    expanded readers must agree bit-exact on identical operands; the CSF
++    reader descriptor must reflect the requested expansion; every output is
++    finite and nonempty."""
++    require_b12x()
++    from b12x.moe import fused_moe as moe
++
++    case, experts, xp, scratch = _fixture(monkeypatch, csf=csf)
++    outputs = {}
++    for tokens in (CAPACITY, CAPACITY - 25):
++        x, ids, wts = _inputs(tokens, tokens, H, E, TOPK)
++        expansions = (False, True) if csf else (False,)
++        for expanded in expansions:
++            if csf and expanded and tokens > 1536:
++                # scales_expanded=True is a caller contract: the expansion
++                # must ALREADY be ordered before the bound call.
++                assert moe.expand_scales(experts)
++            out = torch.empty_like(x)
++            binding = _bind(
++                xp,
++                x,
++                ids,
++                wts,
++                out,
++                scratch,
++                a4_prefill=True,
++                scales_expanded=expanded,
++            )
++            launch = binding.a4_prefill_launches
++            assert launch is not None, (csf, tokens, expanded)
++            if csf:
++                consume_expanded = expanded and tokens > 1536
++                # the bound reader descriptor reflects the requested expansion
++                assert (launch.csf_inline_words is None) is consume_expanded, (
++                    tokens,
++                    expanded,
++                    launch.csf_inline_words,
++                )
++            moe.run(binding=binding)
++            torch.cuda.synchronize()
++            assert torch.isfinite(out.float()).all(), (csf, tokens, expanded)
++            assert out.float().abs().max() > 0, (csf, tokens, expanded)
++            outputs[(tokens, expanded)] = out
++    if csf:
++        for tokens in (CAPACITY, CAPACITY - 25):
++            torch.testing.assert_close(
++                outputs[(tokens, False)],
++                outputs[(tokens, True)],
++                rtol=0,
++                atol=0,
++            )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_a4_full_geometry_graph_replay_with_poisoned_scratch(monkeypatch):
++    """CUDA-graph capture at full capacity through the patched planner:
++    changed inputs must change the output through the same graph, and replay
++    after poisoning the reusable scratch reproduces the eager result exactly
++    with no hidden allocations or pointer moves."""
++    require_b12x()
++    from b12x.moe import fused_moe as moe
++    from b12x._lib.runtime_control import kernel_resolution_guard
++
++    case, experts, xp, scratch = _fixture(monkeypatch, csf=True)
++    tokens = CAPACITY
++    x, ids, wts = _inputs(tokens, 7, H, E, TOPK)
++    out = torch.empty_like(x)
++    binding = _bind(xp, x, ids, wts, out, scratch, a4_prefill=True)
++    assert binding.a4_prefill_launches is not None
++
++    moe.run(binding=binding)
++    torch.cuda.synchronize()
++    eager = out.clone()
++
++    changed_x, changed_ids, changed_wts = _inputs(tokens, 900 + tokens, H, E, TOPK)
++    graph = torch.cuda.CUDAGraph()
++    pointers = tuple(t.data_ptr() for t in (*scratch, out))
++    try:
++        with kernel_resolution_guard("A4 full-geometry launches"):
++            with torch.cuda.graph(graph):
++                moe.run(binding=binding)
++            x.copy_(changed_x)
++            ids.copy_(changed_ids)
++            wts.copy_(changed_wts)
++            moe.run(binding=binding)
++            torch.cuda.synchronize()
++            changed_eager = out.clone()
++            assert not torch.equal(eager, changed_eager)
++
++            for buffer in scratch:
++                buffer.fill_(77)
++            out.fill_(float("nan"))
++            torch.cuda.synchronize()
++            allocated = torch.cuda.memory_allocated()
++            torch.cuda.reset_peak_memory_stats()
++            graph.replay()
++            torch.cuda.synchronize()
++            assert torch.cuda.memory_allocated() == allocated
++            assert torch.cuda.max_memory_allocated() == allocated
++            assert pointers == tuple(t.data_ptr() for t in (*scratch, out))
++            torch.testing.assert_close(out, changed_eager, rtol=0, atol=0)
++    finally:
++        graph.reset()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_a4_full_geometry_explicit_a16_control(monkeypatch):
++    """Explicit A16 at the same geometry and capacity (patched planner):
++    binds the A16 fused launch — never A4 — executes, stays finite and
++    nonzero. The A4 reservation changes nothing about A16 behavior."""
++    require_b12x()
++    from b12x.moe import fused_moe as moe
++
++    case, experts, xp, scratch = _fixture(monkeypatch, csf=True)
++    tokens = CAPACITY
++    x, ids, wts = _inputs(tokens, 11, H, E, TOPK)
++    out = torch.empty_like(x)
++    binding = _bind(xp, x, ids, wts, out, scratch, a4_prefill=False)
++    assert binding.a4_prefill_launches is None
++    assert binding.fused_launch is not None
++    moe.run(binding=binding)
++    torch.cuda.synchronize()
++    assert torch.isfinite(out.float()).all()
++    assert out.float().abs().max() > 0

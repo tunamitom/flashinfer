@@ -1,0 +1,23 @@
+host repo: d16e05bc8ffd95643fa8027c1cd5174f51a49a4b branch=kk-mimo-recut-20261008
+commit-of-record for the workspace fix: d16e05bc8ffd95643fa8027c1cd5174f51a49a4b
+base: a087dfbf783fd5039bd0617092841517929fe9e8
+tree state at qualification time: working tree dirty (6 files), now committed as d16e05bc8; all six files byte-identical between commit and qualified working tree (cmp-verified 2026-10-09)
+committed files:
+  .../b12x/moe/_shared/kernels/w4a16/prefill_a4.py   |  91 ++++-
+  .../experimental/b12x/moe/fused_moe/_impl.py       |  90 +++++
+  .../experimental/b12x/moe/test_w4a16_a4_prefill.py |  20 +-
+  .../b12x/moe/test_w4a16_a4_prefill_admission.py    | 384 +++++++++++++++++++++
+  .../b12x/moe/test_w4a16_a4_prefill_arena.py        | 223 ++++++++++++
+  .../b12x/moe/test_w4a16_a4_prefill_fullgeom.py     | 179 ++++++++++
+  6 files changed, 979 insertions(+), 8 deletions(-)
+file hashes (patched, as committed == as qualified):
+a681c9c281927552137bab500f255d3ad998a141598fe4be7d87235fd2b864c9 flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/prefill_a4.py
+d06345cd5377d380c3c0043bbecc4c150a582c2aae1e7ea6967911479eb92644 flashinfer/experimental/b12x/moe/fused_moe/_impl.py
+d40aa964199702216ef52444aa184b038078b29b626b43e745e437454ba20652 tests/experimental/b12x/moe/test_w4a16_a4_prefill.py
+80f25a39e338fa00a262f689eabe2f39a4f2cb5cb4c14706426d77c18d0bbd3f tests/experimental/b12x/moe/test_w4a16_a4_prefill_admission.py
+6403dbec1188fdcb53e42216891fddc09714ff2d4ae2c4303ea7d761d9e90558 tests/experimental/b12x/moe/test_w4a16_a4_prefill_arena.py
+c5fde2d9395795c0013a691ae70fc3a55f9a778c5f84990465a86f3ff1aa3314 tests/experimental/b12x/moe/test_w4a16_a4_prefill_fullgeom.py
+image-side file hashes (pristine, image kk-unified-20261008-r13 sha256:fe71cf0287c36e31eb7ffc5dc01e4658d148afd5587dcd2b0faca8cca532b721):
+51abf1a572d9ca0f6885d5d574b6455d2817e54935321c29037f65592b096e2c  prefill_a4.py (image)
+f250c032273d33c23ec1b8d0636e4e9a98b05c0edea260a7e1d11f872b2b4e79  _impl.py (image)
+patch-of-record.diff: sha256 e5cfb17af4fe79460518a1962f1a8c54d6e2ade58183164d5b36c32c8642224e  (1112 lines; equals git diff a087dfbf..d16e05bc for the six files)
