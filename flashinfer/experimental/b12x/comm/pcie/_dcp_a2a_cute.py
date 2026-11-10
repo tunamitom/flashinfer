@@ -21,7 +21,11 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
 
-from ._dcp_cute_common import _membar_sys, block_pair_barrier
+from ._dcp_cute_common import (
+    _membar_sys,
+    block_pair_barrier,
+    block_pair_barrier_acquire,
+)
 from ._cute_intrinsics import (
     float_order_key,
     redux_max_u32,
@@ -48,6 +52,17 @@ _PREPARED_LSE_LAUNCHERS: set[tuple[object, ...]] = set()
 _PREPARED_GATHER_LAUNCHERS: set[tuple[object, ...]] = set()
 _PREPARED_PAIR_LAUNCHERS: set[tuple[object, ...]] = set()
 _PREPARED_KIMI_TOPK_LAUNCHERS: set[int] = set()
+
+
+# Opt-in: the barrier-transport all_gather_heads (attention/DCP gathers) polls
+# its peer flags with ld.acquire.sys and drops the separate post-barrier
+# membar.sys (the all-reduce's flag scheme). Default keeps the original kernel.
+GATHER_ACQUIRE_ENV = "B12X_PCIE_DCP_GATHER_ACQUIRE"
+
+
+def gather_acquire_enabled() -> bool:
+    """Read the all_gather_heads acquire-flag switch (plan/compile time, default off)."""
+    return os.environ.get(GATHER_ACQUIRE_ENV, "0").strip() not in ("", "0")
 
 
 @dsl_user_op
@@ -1087,16 +1102,25 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                     )
                     st_global_v4_u32((output + output_pack * Int64(4)).toint(), *values)
                 tile += warp_stride
-            block_pair_barrier(
-                signals,
-                self_signal=signals[self._rank],
-                rank=self._rank,
-                world_size=self._world_size,
-                max_blocks=_MAX_BLOCKS,
-            )
-            if Int32(tidx) == Int32(0):
-                _membar_sys()
-            cute.arch.sync_threads()
+            if cutlass.const_expr(getattr(self, "_gather_acquire", False)):
+                block_pair_barrier_acquire(
+                    signals,
+                    self_signal=signals[self._rank],
+                    rank=self._rank,
+                    world_size=self._world_size,
+                    max_blocks=_MAX_BLOCKS,
+                )
+            else:
+                block_pair_barrier(
+                    signals,
+                    self_signal=signals[self._rank],
+                    rank=self._rank,
+                    world_size=self._world_size,
+                    max_blocks=_MAX_BLOCKS,
+                )
+                if Int32(tidx) == Int32(0):
+                    _membar_sys()
+                cute.arch.sync_threads()
             tile = warp_first
             while tile < tiles:
                 batch_index = tile // tiles_per_rank
@@ -1148,17 +1172,27 @@ class _AllGatherHeadsLaunch(_DCPA2ABase):
                             )
                 tile += warp_stride
 
-            block_pair_barrier(
-                signals,
-                self_signal=signals[self._rank],
-                rank=self._rank,
-                world_size=self._world_size,
-                max_blocks=_MAX_BLOCKS,
-            )
-            # Acquire the peers' pushed segments before reading them locally.
-            if Int32(tidx) == Int32(0):
-                _membar_sys()
-            cute.arch.sync_threads()
+            if cutlass.const_expr(getattr(self, "_gather_acquire", False)):
+                # Peer flags are polled with ld.acquire.sys inside the barrier.
+                block_pair_barrier_acquire(
+                    signals,
+                    self_signal=signals[self._rank],
+                    rank=self._rank,
+                    world_size=self._world_size,
+                    max_blocks=_MAX_BLOCKS,
+                )
+            else:
+                block_pair_barrier(
+                    signals,
+                    self_signal=signals[self._rank],
+                    rank=self._rank,
+                    world_size=self._world_size,
+                    max_blocks=_MAX_BLOCKS,
+                )
+                # Acquire the peers' pushed segments before reading them locally.
+                if Int32(tidx) == Int32(0):
+                    _membar_sys()
+                cute.arch.sync_threads()
 
             tile = warp_first
             while tile < tiles:
@@ -2022,14 +2056,16 @@ def _gather_launcher_key(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    acquire: bool = False,
 ) -> tuple[object, ...]:
     """Return the cache key for an all-gather-heads launcher."""
-    return (
+    key = (
         int(world_size),
         int(rank),
         int(threads),
         bool(device_slot_selection),
     )
+    return key + ("acquire",) if acquire else key
 
 
 def is_all_gather_heads_prepared(
@@ -2037,6 +2073,7 @@ def is_all_gather_heads_prepared(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    acquire: bool | None = None,
 ) -> bool:
     return (
         _gather_launcher_key(
@@ -2044,6 +2081,7 @@ def is_all_gather_heads_prepared(
             rank,
             threads,
             device_slot_selection,
+            gather_acquire_enabled() if acquire is None else acquire,
         )
         in _PREPARED_GATHER_LAUNCHERS
     )
@@ -2055,6 +2093,7 @@ def _get_compiled_all_gather_heads(
     rank: int,
     threads: int,
     device_slot_selection: bool,
+    acquire: bool = False,
 ) -> Callable:
     """Compile and retain one all-gather-heads launcher specialization."""
     launch = _AllGatherHeadsLaunch(
@@ -2063,11 +2102,10 @@ def _get_compiled_all_gather_heads(
         threads,
         device_slot_selection,
     )
-    key = (
-        int(world_size),
-        int(rank),
-        int(threads),
-        bool(device_slot_selection),
+    if acquire:
+        launch._gather_acquire = True
+    key = _gather_launcher_key(
+        world_size, rank, threads, device_slot_selection, acquire
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
@@ -2093,7 +2131,8 @@ def _get_compiled_all_gather_heads(
                 "rank",
                 "threads",
                 "device_slot_selection",
-            ),
+            )
+            + (("sync",) if acquire else ()),
         ),
     )
 
@@ -2406,11 +2445,13 @@ def all_gather_heads(
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     if launcher is None:
+        acquire = gather_acquire_enabled()
         launcher = _get_compiled_all_gather_heads(
             world_size,
             rank,
             threads,
             device_slot_selection,
+            acquire,
         )
         if not device_slot_selection:
             _get_compiled_all_gather_heads(
@@ -2418,6 +2459,7 @@ def all_gather_heads(
                 rank,
                 threads,
                 True,
+                acquire,
             )
     launcher(
         local_input_ptr,

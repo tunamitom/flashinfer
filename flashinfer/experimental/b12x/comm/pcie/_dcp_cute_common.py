@@ -82,6 +82,80 @@ def _load_relaxed_sys_u32(
     )
 
 
+@dsl_user_op
+def _load_acquire_sys_u32(
+    ptr: cute.Pointer,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.sys.global.u32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def block_pair_barrier_acquire(
+    signals: Sequence[cute.Pointer],
+    *,
+    self_signal: cute.Pointer,
+    rank: int,
+    world_size: int,
+    max_blocks: int,
+) -> None:
+    """``block_pair_barrier`` with the all-reduce flag scheme's consumer side.
+
+    Same records, generation and publication (system fence, then a relaxed
+    system flag store), but each lane polls its peer flag with
+    ``ld.acquire.sys``; the closing CTA barrier extends that acquire to every
+    thread, so callers need no separate ``membar.sys`` before reading the
+    peers' pushed data (pattern of ``pair_arrive_and_wait`` in the one-shot
+    all-reduce).
+    """
+    cute.arch.sync_threads()
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    if Int32(tidx) < Int32(world_size):
+        peer_signal_address = Int64(signals[0].toint())
+        for peer in cutlass.range_constexpr(1, world_size):
+            if Int32(tidx) == Int32(peer):
+                peer_signal_address = Int64(signals[peer].toint())
+        peer_signal = cute.make_ptr(
+            Uint32,
+            peer_signal_address,
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        )
+        _membar_sys()
+        self_index = Int64(bidx) * Int64(_MAX_RANKS) + Int64(tidx)
+        self_ptr = self_signal + self_index
+        value = Uint32(cute.arch.load(self_ptr, Uint32)) + Uint32(1)
+        cute.arch.store(self_ptr, value)
+
+        slot = Int64(value % Uint32(2))
+        common_index = Int64(max_blocks * _MAX_RANKS) + (
+            (slot * Int64(max_blocks) + Int64(bidx)) * Int64(_MAX_RANKS * _FLAG_STRIDE)
+        )
+        peer_index = common_index + Int64(rank * _FLAG_STRIDE)
+        mine_index = common_index + Int64(tidx) * Int64(_FLAG_STRIDE)
+        _store_relaxed_sys_u32(peer_signal + peer_index, value)
+        observed = _load_acquire_sys_u32(self_signal + mine_index)
+        while observed != value:
+            observed = _load_acquire_sys_u32(self_signal + mine_index)
+
+    cute.arch.sync_threads()
+
+
 @cute.jit
 def block_pair_barrier(
     signals: Sequence[cute.Pointer],
@@ -139,4 +213,4 @@ def signal_bytes(max_blocks: int) -> int:
     return (max_blocks * _MAX_RANKS + 2 * max_blocks * _MAX_RANKS * _FLAG_STRIDE) * 4
 
 
-__all__ = ["block_pair_barrier", "signal_bytes"]
+__all__ = ["block_pair_barrier", "block_pair_barrier_acquire", "signal_bytes"]

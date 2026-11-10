@@ -52,6 +52,12 @@ _SIGNAL_BYTES = (
 ) * 4
 
 
+def _state_gather_acquire(state) -> bool:
+    """Whether a prepared all_gather_heads plan uses the acquire-flag barrier."""
+    query = getattr(state, "query", None)
+    call = getattr(query, "call", None)
+    return bool(call is not None and call.get("gather_sync") == "acquire")
+
 def _env_int(name: str, fallback: int) -> int:
     raw = os.getenv(name)
     if not raw:
@@ -1100,6 +1106,7 @@ class PCIeDCPA2A:
                 self.rank,
                 threads,
                 True,
+                _state_gather_acquire(state),
             ):
                 raise RuntimeError(
                     "cold PCIe DCP gather CUDA graph capture is not allowed; "
