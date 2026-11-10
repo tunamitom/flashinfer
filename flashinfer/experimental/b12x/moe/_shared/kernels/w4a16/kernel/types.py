@@ -102,6 +102,9 @@ class W4A16FusedMoeCompileResult:
     broadcast_suh: bool = False
     small_m_direct_launches: tuple[_W4A16SmallMDirectLaunch, ...] = ()
     trellis_direct_lut: bool = False
+    # B12X_TRELLIS_INKERNEL_ROUTE_PACK: the kernel can build the packed route
+    # layout itself when the host passes the top-k ids (route_ids).
+    inkernel_route_pack: bool = False
 
 
 @dataclass(frozen=True)

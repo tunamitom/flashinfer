@@ -33,6 +33,8 @@ from b12x._lib.intrinsics.memory import shared_ptr_to_u32
 from b12x._lib.intrinsics.atomics import st_global_i32
 from b12x._lib.intrinsics.memory import st_global_v4_u32
 from b12x._lib.intrinsics.atomics import st_shared_f32
+from b12x._lib.intrinsics.atomics import ld_shared_i32
+from b12x._lib.intrinsics.atomics import st_shared_i32
 from b12x._lib.intrinsics.memory import st_shared_v4_u32
 from b12x._lib.intrinsics.sync import threadfence
 from b12x._lib.intrinsics.memory import u32_as_f32
@@ -501,6 +503,28 @@ class W4A16FusedMoeKernel:
         self.trellis_lut_smem_bytes = (
             65536 if self.trellis_direct_lut else _LUT_E4M3_SMEM_REGION_BYTES
         )
+        # Opt-in: build the packed route layout (packed_route_indices,
+        # block_expert_ids, packed_route_count) inside the fused kernel instead
+        # of the two Triton route-pack launches.  The last CTA's last four warps
+        # (idle during the shared input rotation) pack <= 128 routes before
+        # grid barrier 1, which publishes them to FC1.  Within an expert,
+        # routes are ordered by route index (deterministic); FC rows are
+        # independent, so the output is unchanged.  The host opts in per call
+        # (route_num_experts == -1 carries the int32 top-k ids pointer in the
+        # expert-map slot); any other call keeps the Triton packing.
+        self.inkernel_route_pack = (
+            os.environ.get("B12X_TRELLIS_INKERNEL_ROUTE_PACK", "0") == "1"
+            and self.full_rotation
+            and self.shared_input_rotation
+            and self.intermediate_hadamard
+            and not self.direct_topk_routes
+            and not self.use_expert_map
+            and self.fc1_trellis_pair_kind is None
+            and self.activation_is_gated
+            and self.cta_threads >= 128
+            and not self.tc_decode_fused_sum
+            and not self.prefill_fused_sum_fp32
+        )
         self.lut_e4m3_smem_off = 0
         if self.lut_e4m3_smem:
             self.lut_e4m3_smem_off = (self.shared_words * 4 + 15) // 16 * 16
@@ -575,6 +599,7 @@ class W4A16FusedMoeKernel:
             self.rotation_input_dtype,
             self.lut_e4m3_smem,
             self.trellis_direct_lut,
+            self.inkernel_route_pack,
             self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -859,6 +884,15 @@ class W4A16FusedMoeKernel:
                 (Int64(route_num_experts) + Int64(1),), stride=(1,)
             ),
         )
+        if cutlass.const_expr(self.inkernel_route_pack):
+            # In-kernel route packing: the expert-map slot carries the int32
+            # top-k ids (the packed path never uses an expert map).
+            expert_map_flat = cute.make_tensor(
+                expert_map_ptr,
+                layout=cute.make_layout(
+                    (Int64(active_m) * Int64(self.top_k) + Int64(1),), stride=(1,)
+                ),
+            )
         fc1_trellis_lut_flat = cute.make_tensor(
             fc1_trellis_lut_ptr,
             layout=cute.make_layout(
@@ -1157,6 +1191,20 @@ class W4A16FusedMoeKernel:
             table_addr = Int64(smem_base + Int32(self.lut_e4m3_smem_off))
             fc1_phase_lut = table_addr
             fc2_phase_lut = table_addr
+        if cutlass.const_expr(self.inkernel_route_pack):
+            if route_num_experts < Int32(0):
+                self._pack_routes_in_kernel(
+                    expert_map_flat,
+                    packed_route_indices,
+                    block_expert_ids,
+                    packed_route_count,
+                    weight_num_experts,
+                    smem_base,
+                    tid,
+                    cta,
+                    grid_x,
+                    active_m,
+                )
         if cutlass.const_expr(self.full_rotation):
             if cutlass.const_expr(self.intermediate_hadamard):
                 self._run_input_rotation_intermediate_hadamard(
@@ -1447,6 +1495,86 @@ class W4A16FusedMoeKernel:
             i += Int32(self.cta_threads)
 
     @cute.jit
+    def _pack_routes_in_kernel(
+        self,
+        route_ids_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        weight_num_experts: Int32,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: cutlass.Int32,
+    ):
+        """Pack <= 128 routes by expert (same layout as route_pack.py).
+
+        Runs on the last 4 warps of the last CTA before grid barrier 1. Route u
+        (warp w = u // 32, lane = u % 32) gets rank = #earlier routes of its
+        expert; a route with rank % BS == 0 heads a BS-row block; its slot is
+        BS * #heads of smaller experts + rank. The last route of an expert
+        fills the segment padding with the live-route sentinel. Uses the first
+        512 B of the (still unused) GEMM staging smem for the head keys."""
+        bs = self.moe_block_size
+        numel = active_m * Int32(self.top_k)
+        warp_in_cta = tid >> Int32(5)
+        lane = tid & Int32(31)
+        pw = warp_in_cta - Int32(self.cta_threads // 32 - 4)
+        if cta == grid_x - Int32(1) and pw >= Int32(0):
+            big = Int32(0x7FFFFFFF)
+            ids = cute.make_rmem_tensor((4,), Int32)
+            for c in cutlass.range_constexpr(4):
+                u = Int32(c * 32) + lane
+                x = Int32(-1)
+                if u < numel:
+                    x = route_ids_flat[u].to(Int32)
+                    if x < Int32(0) or x >= weight_num_experts:
+                        x = Int32(-1)
+                ids[c] = x
+            my = ids[0]
+            for c in cutlass.range_constexpr(1, 4):
+                if pw == Int32(c):
+                    my = ids[c]
+            u_me = pw * Int32(32) + lane
+            rank = Int32(0)
+            cnt = Int32(0)
+            for c in cutlass.range_constexpr(4):
+                for j in cutlass.range_constexpr(32):
+                    x = cute.arch.shuffle_sync(ids[c], j)
+                    if x == my:
+                        cnt += Int32(1)
+                        if Int32(c * 32 + j) < u_me:
+                            rank += Int32(1)
+            key = big
+            if my >= Int32(0) and rank % Int32(bs) == Int32(0):
+                key = my
+            st_shared_i32(smem_base + u_me * Int32(4), key)
+            cute.arch.barrier(barrier_id=1, number_of_threads=128)
+            heads_below = Int32(0)
+            heads_total = Int32(0)
+            for v in cutlass.range_constexpr(128):
+                kv = ld_shared_i32(smem_base + Int32(v * 4))
+                if kv < my:
+                    heads_below += Int32(1)
+                if kv != big:
+                    heads_total += Int32(1)
+            if my >= Int32(0):
+                before = heads_below * Int32(bs)
+                pos = before + rank
+                packed_route_indices[pos] = u_me
+                if rank % Int32(bs) == Int32(0):
+                    block_expert_ids[pos // Int32(bs)] = my
+                if rank == cnt - Int32(1):
+                    seg_end = before + (cnt + Int32(bs - 1)) // Int32(bs) * Int32(bs)
+                    for s in cutlass.range_constexpr(bs - 1):
+                        q = pos + Int32(1 + s)
+                        if q < seg_end:
+                            packed_route_indices[q] = numel
+            if u_me == Int32(0):
+                packed_route_count[Int32(0)] = heads_total * Int32(bs)
+
+    @cute.jit
     def _grid_barrier(
         self,
         locks_i32_flat: cute.Tensor,
@@ -1603,7 +1731,12 @@ class W4A16FusedMoeKernel:
         warps_per_cta = Int32(self.cta_threads // 32)
         nblk = Int32(self.hidden_size // 512)
         live_routes = active_m * Int32(self.top_k)
-        route_count = packed_route_count[Int32(0)].to(Int32)
+        if cutlass.const_expr(self.inkernel_route_pack):
+            # The packed count is produced concurrently; the shared input
+            # rotation only needs active_m.
+            route_count = active_m
+        else:
+            route_count = packed_route_count[Int32(0)].to(Int32)
         if cutlass.const_expr(self.direct_topk_routes):
             route_count = live_routes
         if cutlass.const_expr(self.shared_input_rotation):

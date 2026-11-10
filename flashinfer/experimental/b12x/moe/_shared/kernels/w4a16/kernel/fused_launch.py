@@ -799,6 +799,7 @@ def compile_w4a16_fused_moe(
         broadcast_suh=bool(broadcast_suh),
         small_m_direct_launches=tuple(small_m_direct_launches),
         trellis_direct_lut=kernel.trellis_direct_lut,
+        inkernel_route_pack=kernel.inkernel_route_pack,
     )
     attach_programs(
         result, compiled, *(launch.compiled for launch in small_m_direct_launches)
@@ -873,6 +874,7 @@ def _w4a16_fused_moe_launch_flat(
     suh_gate_table: torch.Tensor | None = None,
     suh_up_table: torch.Tensor | None = None,
     launcher: W4A16FusedMoeCompileResult | None = None,
+    route_ids: torch.Tensor | None = None,
 ) -> None:
     swiglu_limit = float(swiglu_limit_value) if has_swiglu_limit else None
     collect_activation_amax = bool(collect_activation_amax)
@@ -986,6 +988,23 @@ def _w4a16_fused_moe_launch_flat(
         packed_route_indices.data_ptr() if expert_map is None else expert_map.data_ptr()
     )
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
+    if route_ids is not None:
+        # In-kernel route packing (B12X_TRELLIS_INKERNEL_ROUTE_PACK): the
+        # expert-map slot carries the int32 top-k ids, route_num_experts=-1
+        # tells the kernel to build packed_route_indices / block_expert_ids /
+        # packed_route_count itself.
+        if (
+            expert_map is not None
+            or direct_topk_routes
+            or not bool(getattr(fused, "inkernel_route_pack", False))
+            or route_ids.dtype != torch.int32
+            or not route_ids.is_contiguous()
+            or int(route_ids.numel()) != int(m) * int(topk)
+            or int(route_ids.numel()) > 128
+        ):
+            raise ValueError("in-kernel route packing launch contract violated")
+        expert_map_addr = route_ids.data_ptr()
+        route_num_experts = -1
     if weight_layout in IQ2_CODECS:
         iq2_lut = iq2_xs_execution_lut(
             a_input.device, selectors=True, codec=weight_layout
