@@ -164,6 +164,10 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         # Only present when on, so default gather queries keep their identity.
         if gather_acquire_enabled():
             metadata["gather_sync"] = "acquire"
+        from ._dcp_a2a_cute import gather_island_enabled
+
+        if gather_island_enabled(int(runtime.world_size)):
+            metadata["gather_topology"] = "island"
     if surface.endswith(("lse_reduce_scatter", "all_gather_heads")):
         out = call.get("out")
         heads = (
@@ -233,6 +237,7 @@ def compile_dcp_surface(query_payload, ordinal):
                     int(call["threads"]),
                     slot,
                     call.get("gather_sync") == "acquire",
+                    call.get("gather_topology") == "island",
                 )
                 for slot in (False, True)
             }
