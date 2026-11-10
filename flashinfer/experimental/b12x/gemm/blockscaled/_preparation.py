@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import b12x._lib.dense_gemm.buffers as _module__lib_dense_gemm_buffers
 import b12x._lib.dense_gemm.compile as _module__lib_dense_gemm_compile
 import b12x._lib.dense_gemm.config as _module__lib_dense_gemm_config
@@ -23,6 +25,11 @@ from b12x._lib.utils.device import current_cuda_stream, cuda_stream_to_int
 from b12x._lib.utils.pointers import make_ptr
 from b12x.preparation import FrozenMapping, MemoryRequirements, PersistentMemory, Plan
 from b12x.preparation.types import _CompositePlan
+
+# Opt-in (default off): launch the A16 split-K reduce as a programmatic dependent
+# (PDL) of its split GEMM, which releases it as soon as every GEMM CTA has started.
+# The reduce still waits for GEMM completion; its arithmetic is unchanged.
+_A16_SPLITK_REDUCE_PDL = os.environ.get("B12X_A16_SPLITK_REDUCE_PDL", "0") == "1"
 from ._tuning import (
     MXFP8_PREFILL_MIN_ROWS as _MXFP8_PREFILL_MIN_ROWS,
     MXFP8_A16_DEQUANT_MIN_ROWS,
@@ -167,7 +174,13 @@ def compile_packed(
                 (config.tile_m or 16, bn),
                 (1, 1),
                 _module__lib_dense_gemm_config._DenseGemmPolicy(
-                    True, True, False, slices, False, False
+                    True,
+                    True,
+                    False,
+                    slices,
+                    False,
+                    False,
+                    split_k_pdl_reduce=slices > 1 and _A16_SPLITK_REDUCE_PDL,
                 ),
                 sm_count,
                 f"sm_{capability[0]}{capability[1]}a",
@@ -186,7 +199,7 @@ def compile_packed(
             programs = {"gemm": gemm, **activation_program}
             if slices > 1:
                 programs["reduce"] = _reduce.compile_reduce(
-                    query.out_features, slices, ordinal
+                    query.out_features, slices, ordinal, pdl=_A16_SPLITK_REDUCE_PDL
                 )
             if mxfp8_a16_dequant(query, config):
                 from ._dequant import DEQUANT_BLOCK_K, _dequantize_mxfp8

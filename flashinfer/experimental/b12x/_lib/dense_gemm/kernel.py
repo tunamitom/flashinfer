@@ -138,6 +138,7 @@ class DenseGemmKernel:
         direct_one_m_tile_scheduler: bool = False,
         split_k_slices: int = 1,
         split_k_atomic_bf16: bool = False,
+        split_k_pdl_reduce: bool = False,
         large_m_unroll: bool = False,
         preserve_raster: bool = False,
         use_m1_non_tma_a: bool = False,
@@ -353,6 +354,7 @@ class DenseGemmKernel:
         )
         self.split_k_slices = split_k_slices
         self.split_k_atomic_bf16 = split_k_atomic_bf16
+        self.split_k_pdl_reduce = split_k_pdl_reduce and split_k_slices > 1
         self.large_m_unroll = large_m_unroll
         self.preserve_raster = preserve_raster
         self.use_m1_non_tma_a = use_m1_non_tma_a
@@ -3251,6 +3253,13 @@ class DenseGemmKernel:
 
         elif warp_idx == self.tma_load_warp_id:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
+            if cutlass.const_expr(
+                self.split_k_pdl_reduce and not self.programmatic_serialization
+            ):
+                # Let the PDL-launched split-K reducer get scheduled while this
+                # CTA streams its K slice; it waits for grid completion before
+                # reading any partial, so this only hides its launch.
+                cute.arch.griddepcontrol_launch_dependents()
 
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
