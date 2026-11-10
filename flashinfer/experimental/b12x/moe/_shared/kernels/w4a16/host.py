@@ -242,8 +242,13 @@ def trellis_prefill_launch_shape(m: int) -> dict | None:
     m = int(m)
     if m < 128:
         return None
-    if m >= 2048:
+    if m >= 2560:
         return {"block_size_m": 64, "pipeline_stages": 3, "trellis_decode_table": "compact"}
+    if m >= 2048:
+        # Measured 2026-11-10 (levers/evidence/a2-trellis): at 2048 rows every
+        # variant loses to the heuristic plan (stock 3,496 us; 64-row shape
+        # 3,654; direct+2 stages block 32 3,808). Leave it alone.
+        return None
     if m >= 1024:
         return {"block_size_m": 32, "pipeline_stages": 2, "trellis_decode_table": "full"}
     return {"block_size_m": 16, "pipeline_stages": 3, "trellis_decode_table": "full"}

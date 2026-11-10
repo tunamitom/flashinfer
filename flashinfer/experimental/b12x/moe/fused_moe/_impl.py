@@ -8603,24 +8603,20 @@ def _plan_full_rotation_w4a16_launches(
 
         Planner knobs (MoeDecodeConfig.w4a16_*; inert before this wiring) win
         when explicitly set, then the measured prefill shapes (R3,
-        trellis_prefill_launch_shape), then the arena heuristic plan.
+        trellis_prefill_launch_shape), then the arena heuristic plan. The block
+        itself is resolved once by _resolve_trellis_route_block_size (sizing
+        and binding share it); stages/tiles/table are compile-time only.
         """
         measured = trellis_prefill_launch_shape(token_count) or {}
-        block = (
-            caps.decode_config.w4a16_block_size_m
-            or caps.w4a16_block_size_m
-            or measured.get("block_size_m")
-            or block_size_m
-        )
+        block = block_size_m
         stages = caps.decode_config.w4a16_pipeline_stages or measured.get(
             "pipeline_stages"
         )
         tiles = caps.decode_config.w4a16_tile_config or core_plan.trellis_tile_config
+        # The decode table is its own control (auto/compact/full). Note that
+        # w4a16_route_mode ("packed"/"direct") selects route PACKING, not the
+        # Trellis decode table - do not map one onto the other.
         table = measured.get("trellis_decode_table") or caps.trellis_decode_table
-        if caps.decode_config.w4a16_route_mode == "direct":
-            table = "full"
-        elif caps.decode_config.w4a16_route_mode == "packed":
-            table = "compact"
         return int(block), stages, tiles, table
 
     block_size_m, _, _, _ = _launch_shape(capacity_tokens)
@@ -9119,6 +9115,25 @@ def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
         bucket_w4a16_tokens=False,
     )
     route_experts = caps.route_num_experts or caps.weight_E
+    from b12x.moe._shared.kernels.w4a16.host import trellis_prefill_launch_shape
+
+    measured = (
+        trellis_prefill_launch_shape(max(token_counts))
+        if caps.weight_plan.trellis_pair_kinds is None
+        else None
+    ) or {}
+    # R3's measured prefill shape feeds the shared resolver (arena sizing AND
+    # launch binding), so the 64-row blocks at M >= 2048 are covered by the
+    # route-slot scratch, not just the launch. Like an explicit knob, the
+    # env-gated measured policy asserts its block directly: it was measured to
+    # compile and run (smem 73,216 at block 64 / 3 stages, 5.8 -> 4.3 ms at
+    # M=3072), while the heuristic's _candidate_tile_fits check rejects it
+    # (it prices the 4-stage staging) and silently falls back to 48 rows.
+    policy_block = (
+        int(measured["block_size_m"]) if measured.get("block_size_m") else None
+    )
+    if policy_block:
+        return policy_block
     preferred = select_route_block_size_m(
         max(token_counts),
         caps.num_topk,
@@ -9430,18 +9445,16 @@ def _prewarm_w4a16_planned_launches(
             # R3: measured prefill launch shapes (env B12X_W4A16_PREFILL_SHAPES)
             # override the heuristic for prefill sizes only, and only for the
             # full-rotation Trellis kernel they were measured on (no per-pair
-            # extents; other W4A16 layouts keep the heuristic).
+            # extents; other W4A16 layouts keep the heuristic). The block comes
+            # from the shared arena resolver; stages and decode table are
+            # compile-time only.
             measured = (
                 trellis_prefill_launch_shape(token_count)
                 if full_rotation and _fc_trellis_pair_kind(workspace) is None
                 else None
             ) or {}
-            block_size_m = (
-                measured.get("block_size_m")
-                or workspace.route_block_size_m
-                or select_route_block_size_m(
-                    token_count, workspace.num_topk, workspace.route_E
-                )
+            block_size_m = workspace.route_block_size_m or select_route_block_size_m(
+                token_count, workspace.num_topk, workspace.route_E
             )
             launch_stages = measured.get("pipeline_stages")
             launch_table = measured.get("trellis_decode_table", "auto")
