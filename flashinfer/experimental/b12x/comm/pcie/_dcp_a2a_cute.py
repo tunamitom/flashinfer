@@ -6,6 +6,7 @@ import os
 from collections.abc import Callable, Sequence
 
 from b12x._lib.compile_plan import attach_programs
+from b12x._lib.env import env_flag
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -88,6 +89,19 @@ def gather_island_enabled(world_size: int | None = None) -> bool:
     """Read the two-island gather switch (plan/compile time, default off; W==8 only)."""
     on = os.environ.get(GATHER_ISLAND_ENV, "0").strip() not in ("", "0")
     return on and (world_size is None or int(world_size) == 8)
+
+
+def lse_push_tp8_enabled() -> bool:
+    """Opt-in push transport for the TP8 LSE reduce-scatter (default: pull).
+
+    ``B12X_PCIE_DCP_LSE_PUSH_TP8=1`` makes every TP8 rank write each
+    destination's heads into that destination's staging (posted PCIe writes,
+    as TP2/TP4 already do) instead of reading seven peers' staging after the
+    barrier.  The value is read when the launcher is compiled, so it must be
+    identical on every rank and fixed for the process lifetime.
+    """
+
+    return env_flag("PCIE_DCP_LSE_PUSH_TP8", default=False)
 
 
 @dsl_user_op
@@ -413,6 +427,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         dtype_name: str,
         threads: int,
         device_slot_selection: bool,
+        push_tp8: bool = False,
     ) -> None:
         super().__init__(
             world_size,
@@ -421,6 +436,23 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             device_slot_selection,
         )
         self._dtype_name = str(dtype_name)
+        # Push transport: TP2/TP4 always; TP8 only behind the opt-in
+        # B12X_PCIE_DCP_LSE_PUSH_TP8 switch (process-constant, read at
+        # compile-factory time).  TP4/TP8 index incoming rows by source rank.
+        self._push = self._world_size in (2, 4) or (
+            self._world_size == 8 and bool(push_tp8)
+        )
+        self._indexed_push = self._push and self._world_size != 2
+        # TP8 push issues destinations in XOR order with the cross-island
+        # partners (rank ^ 4..7) first: every step is a perfect matching, so
+        # no destination receives from all ranks at once.  Other paths keep
+        # the ascending order.
+        if self._push and self._world_size == 8:
+            self._destination_order = tuple(
+                self._rank ^ (step ^ 4) for step in range(8)
+            )
+        else:
+            self._destination_order = tuple(range(self._world_size))
 
     @cute.jit
     def __call__(
@@ -661,10 +693,9 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         while row < rows:
             batch_index = row // heads_per_rank
             local_head = row - batch_index * heads_per_rank
-            for destination in cutlass.range_constexpr(self._world_size):
-                if cutlass.const_expr(
-                    self._world_size not in (2, 4) or destination != self._rank
-                ):
+            for step in cutlass.range_constexpr(self._world_size):
+                destination = self._destination_order[step]
+                if cutlass.const_expr(not self._push or destination != self._rank):
                     source_row = (
                         Int64(batch_index) * Int64(total_heads)
                         + Int64(destination) * Int64(heads_per_rank)
@@ -679,7 +710,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                         * input_stride_head
                     )
                     incoming_row = source_row
-                    if cutlass.const_expr(self._world_size == 4):
+                    if cutlass.const_expr(self._indexed_push):
                         incoming_row = (
                             Int64(batch_index) * Int64(total_heads)
                             + Int64(self._rank) * Int64(heads_per_rank)
@@ -714,7 +745,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             world_size=self._world_size,
             max_blocks=_MAX_BLOCKS,
         )
-        if cutlass.const_expr(self._world_size in (2, 4)):
+        if cutlass.const_expr(self._push):
             # Acquire the peer's pushed partials before reading them locally.
             if Int32(tidx) == Int32(0):
                 _membar_sys()
@@ -734,11 +765,11 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             lane_lse_base = Int64(local_lse.toint())
             for source_index in cutlass.range_constexpr(1, self._world_size):
                 source = (self._rank + source_index) % self._world_size
-                incoming = self._rank if self._world_size in (2, 4) else source
+                incoming = self._rank if self._push else source
                 source_lse_base = (
                     Int64(staging[incoming].toint()) + slot_offset + lse_offset
                 )
-                if cutlass.const_expr(self._world_size == 4):
+                if cutlass.const_expr(self._indexed_push):
                     source_lse_base += (
                         Int64(source - self._rank) * Int64(heads_per_rank) * Int64(4)
                     )
@@ -796,9 +827,9 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                 if cutlass.const_expr(source == self._rank):
                     source_address = local_output.toint() + local_base * Int64(16)
                 else:
-                    incoming = self._rank if self._world_size in (2, 4) else source
+                    incoming = self._rank if self._push else source
                     incoming_pack = staging_base
-                    if cutlass.const_expr(self._world_size == 4):
+                    if cutlass.const_expr(self._indexed_push):
                         incoming_pack += (
                             Int64(source - self._rank)
                             * Int64(heads_per_rank)
@@ -2323,12 +2354,14 @@ def _get_compiled_lse_reduce_scatter(
     device_slot_selection: bool,
 ) -> Callable:
     """Compile and retain one LSE reduce-scatter launcher specialization."""
+    push_tp8 = int(world_size) == 8 and lse_push_tp8_enabled()
     launch = _LseReduceScatterLaunch(
         world_size,
         rank,
         dtype_name,
         threads,
         device_slot_selection,
+        push_tp8,
     )
     key = (
         int(world_size),
@@ -2337,6 +2370,18 @@ def _get_compiled_lse_reduce_scatter(
         int(threads),
         bool(device_slot_selection),
     )
+    labels = (
+        "world_size",
+        "rank",
+        "dtype",
+        "threads",
+        "device_slot_selection",
+    )
+    if push_tp8:
+        # Only the opt-in variant extends the compile identity, so default
+        # (pull) TP8 programs keep their existing cache keys.
+        key = (*key, "push")
+        labels = (*labels, "tp8_transport")
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
     p_f32 = _f32_ptr(16)
@@ -2364,13 +2409,7 @@ def _get_compiled_lse_reduce_scatter(
             "comm.pcie.dcp_a2a.lse_reduce_scatter",
             35,
             key,
-            labels=(
-                "world_size",
-                "rank",
-                "dtype",
-                "threads",
-                "device_slot_selection",
-            ),
+            labels=labels,
         ),
     )
 
@@ -2415,7 +2454,15 @@ def _get_compiled_lse_reduce_scatter(
             current_cuda_stream(),
         )
 
-    _PREPARED_LSE_LAUNCHERS.add(key)
+    _PREPARED_LSE_LAUNCHERS.add(
+        _lse_launcher_key(
+            world_size,
+            rank,
+            dtype_name,
+            threads,
+            device_slot_selection,
+        )
+    )
     return attach_programs(run, raw)
 
 
