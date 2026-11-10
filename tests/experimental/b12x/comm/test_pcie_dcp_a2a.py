@@ -300,6 +300,53 @@ def test_lse_compile_factory_retains_program_identity(monkeypatch) -> None:
     assert program_keys(launcher) == (program,)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_lse_tp8_push_switch_selects_transport_and_compile_identity(
+    monkeypatch, enabled: bool
+) -> None:
+    from b12x._lib.compile_plan import ProgramKey
+    from b12x.comm.pcie import _dcp_a2a_cute as kernels
+
+    if enabled:
+        monkeypatch.setenv("B12X_PCIE_DCP_LSE_PUSH_TP8", "1")
+    else:
+        monkeypatch.delenv("B12X_PCIE_DCP_LSE_PUSH_TP8", raising=False)
+    compiled = []
+
+    def fake_compile(launch, *args, compile_spec, **kwargs):
+        def raw(*a, **k):
+            return None
+
+        raw.__b12x_programs__ = (ProgramKey("cute", "test", "dcp-lse-push"),)
+        compiled.append((launch, compile_spec))
+        return raw
+
+    monkeypatch.setattr(kernels, "b12x_compile", fake_compile)
+    monkeypatch.setattr(
+        kernels,
+        "raise_if_kernel_resolution_frozen",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(kernels, "_u32_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "_f32_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "_u8_ptr", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(kernels, "current_cuda_stream", lambda: 0)
+
+    for world in (2, 4, 8, 16):
+        kernels._get_compiled_lse_reduce_scatter.__wrapped__(
+            world, 0, "bf16", 512, True
+        )
+    push = {launch._world_size: launch._push for launch, _ in compiled}
+    indexed = {launch._world_size: launch._indexed_push for launch, _ in compiled}
+    assert push == {2: True, 4: True, 8: enabled, 16: False}
+    assert indexed == {2: False, 4: True, 8: enabled, 16: False}
+    specs = {launch._world_size: spec for launch, spec in compiled}
+    assert ("tp8_transport" in specs[8].json_key) is enabled
+    for world in (2, 4, 16):
+        assert "tp8_transport" not in specs[world].json_key
+    assert kernels.is_lse_reduce_scatter_prepared(8, 0, "bf16", 512, True)
+
+
 def test_block_pair_barrier_selects_once_and_keeps_scaled_offsets_int64() -> None:
     from b12x.comm.pcie import _dcp_cute_common as common
 
