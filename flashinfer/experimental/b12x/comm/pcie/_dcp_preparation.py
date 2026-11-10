@@ -156,6 +156,14 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
         # Only present when on, so default (pull) queries keep their identity.
         if pair_push_enabled():
             metadata["pair_transport"] = "push"
+    if surface.endswith("all_gather_heads") and metadata.get(
+        "gather_transport"
+    ) == "barrier":
+        from ._dcp_a2a_cute import gather_acquire_enabled
+
+        # Only present when on, so default gather queries keep their identity.
+        if gather_acquire_enabled():
+            metadata["gather_sync"] = "acquire"
     if surface.endswith(("lse_reduce_scatter", "all_gather_heads")):
         out = call.get("out")
         heads = (
@@ -220,7 +228,11 @@ def compile_dcp_surface(query_payload, ordinal):
                 return {False: program, True: program}
             return {
                 slot: cute._get_compiled_all_gather_heads(
-                    query.world_size, query.rank, int(call["threads"]), slot
+                    query.world_size,
+                    query.rank,
+                    int(call["threads"]),
+                    slot,
+                    call.get("gather_sync") == "acquire",
                 )
                 for slot in (False, True)
             }
