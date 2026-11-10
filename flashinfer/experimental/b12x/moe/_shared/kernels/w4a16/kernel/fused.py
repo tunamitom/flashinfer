@@ -161,6 +161,8 @@ class W4A16FusedMoeKernel:
             )
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
         routed_rows = int(size_m) * int(top_k)
+        # Prefill-only direct-table geometry (see "full1" below).
+        prefill_direct_table = trellis_decode_table == "full1"
         self.size_m = int(size_m)
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
@@ -375,6 +377,7 @@ class W4A16FusedMoeKernel:
             skip_empty_m_blocks=skip_empty_m_blocks,
             small_m_occupancy=small_m_occupancy,
             csf_inline_scales=csf_inline_scales,
+            reduction_over_stages=prefill_direct_table,
         )
         if (
             _FP32_TOPK_WEIGHTS
@@ -427,6 +430,7 @@ class W4A16FusedMoeKernel:
             skip_empty_m_blocks=skip_empty_m_blocks,
             small_m_occupancy=small_m_occupancy,
             csf_inline_scales=csf_inline_scales,
+            reduction_over_stages=prefill_direct_table,
         )
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
         if self.fc1.cta_threads != self.fc2.cta_threads:
@@ -446,8 +450,22 @@ class W4A16FusedMoeKernel:
             self.shared_words += self.iq2_lut_bytes // 4
             self.fc1.iq2_xs_smem_lut = True
             self.fc2.iq2_xs_smem_lut = True
-        if trellis_decode_table not in {"auto", "compact", "full"}:
-            raise ValueError("trellis decode table must be auto, compact, or full")
+        if trellis_decode_table not in {"auto", "compact", "full", "full1"}:
+            raise ValueError(
+                "trellis decode table must be auto, compact, full, or full1"
+            )
+        if trellis_decode_table == "full1":
+            # Opt-in prefill geometry (B12X_W4A16_PREFILL_TABLE, M > 16 plans
+            # only): the direct table at ONE resident CTA per SM. The 64 KiB
+            # table already leaves no room for a second CTA, so the GEMMs'
+            # two-CTA occupancy estimate is clamped instead of rejecting the
+            # table. Launch bounds and the cooperative grid follow.
+            if size_m <= 16:
+                raise ValueError("full1 decode table is a prefill-only geometry")
+            self.fc1.blocks_per_sm = 1
+            self.fc2.blocks_per_sm = 1
+            self.blocks_per_sm = 1
+            trellis_decode_table = "full"
         # Non-Trellis layouts inherit the codebook argument's default, but do
         # not consume its table. Allocating it for block codecs adds 4 KiB
         # outside their occupancy estimate and can reject cooperative launch.
