@@ -81,6 +81,8 @@ META = OpMeta(
         "run",
         "run_kda",
         "run_kda_commit",
+        "prepare_kda_fused_verify",
+        "run_kda_fused_verify",
     ),
     dtypes=("bf16", "fp32", "int32", "int64"),
     recipes=("silu", "sigmoid", "lower_bounded_kda"),
@@ -124,6 +126,8 @@ if TYPE_CHECKING:
         run,
         run_kda,
         run_kda_commit,
+        prepare_kda_fused_verify,
+        run_kda_fused_verify,
     )
 
 install_lazy_api(globals(), META)

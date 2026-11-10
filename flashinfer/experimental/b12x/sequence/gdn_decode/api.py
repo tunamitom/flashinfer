@@ -18,6 +18,7 @@ from ._impl import (
 from ._preparation import plan, invocation_from_tensors
 from ._tuning import GdnConfig, GdnQuery
 from ._commit import KdaCommitBinding, bind_kda_commit, run_kda_commit
+from ._fused_verify import prepare_kda_fused_verify, run_kda_fused_verify
 
 
 def is_supported(device=None) -> bool:
@@ -44,4 +45,6 @@ __all__ = [
     "run",
     "run_kda",
     "run_kda_commit",
+    "prepare_kda_fused_verify",
+    "run_kda_fused_verify",
 ]
