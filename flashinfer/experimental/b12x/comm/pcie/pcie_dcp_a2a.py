@@ -58,6 +58,14 @@ def _state_gather_acquire(state) -> bool:
     call = getattr(query, "call", None)
     return bool(call is not None and call.get("gather_sync") == "acquire")
 
+
+
+def _state_gather_island(state) -> bool:
+    """Whether a prepared all_gather_heads plan uses the two-island transport."""
+    query = getattr(state, "query", None)
+    call = getattr(query, "call", None)
+    return bool(call is not None and call.get("gather_topology") == "island")
+
 def _env_int(name: str, fallback: int) -> int:
     raw = os.getenv(name)
     if not raw:
@@ -1107,6 +1115,7 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 _state_gather_acquire(state),
+                _state_gather_island(state),
             ):
                 raise RuntimeError(
                     "cold PCIe DCP gather CUDA graph capture is not allowed; "

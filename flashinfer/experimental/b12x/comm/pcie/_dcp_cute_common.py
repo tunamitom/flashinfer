@@ -112,6 +112,8 @@ def block_pair_barrier_acquire(
     rank: int,
     world_size: int,
     max_blocks: int,
+    lane_first: int = 0,
+    lane_count: int = -1,
 ) -> None:
     """``block_pair_barrier`` with the all-reduce flag scheme's consumer side.
 
@@ -125,7 +127,14 @@ def block_pair_barrier_acquire(
     cute.arch.sync_threads()
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
-    if Int32(tidx) < Int32(world_size):
+    if cutlass.const_expr(lane_count < 0):
+        participate = Int32(tidx) < Int32(world_size)
+    else:
+        # Peer subset [lane_first, lane_first + lane_count): pair counters and
+        # flag slots are per (block, peer), so a subset barrier stays
+        # consistent as long as both ranks of each pair use the same subsets.
+        participate = Uint32(Int32(tidx) - Int32(lane_first)) < Uint32(lane_count)
+    if participate:
         peer_signal_address = Int64(signals[0].toint())
         for peer in cutlass.range_constexpr(1, world_size):
             if Int32(tidx) == Int32(peer):
@@ -164,6 +173,8 @@ def block_pair_barrier(
     rank: int,
     world_size: int,
     max_blocks: int,
+    lane_first: int = 0,
+    lane_count: int = -1,
 ) -> None:
     """Match the native per-block, per-peer double-buffered barrier."""
     cute.arch.sync_threads()
@@ -174,7 +185,14 @@ def block_pair_barrier(
     # the participating lanes.  Keeping the body outside the constexpr loop
     # matches CUDA's runtime-indexed RankSignals path without cloning the
     # fence/store/poll sequence once per peer.
-    if Int32(tidx) < Int32(world_size):
+    if cutlass.const_expr(lane_count < 0):
+        participate = Int32(tidx) < Int32(world_size)
+    else:
+        # Peer subset [lane_first, lane_first + lane_count): pair counters and
+        # flag slots are per (block, peer), so a subset barrier stays
+        # consistent as long as both ranks of each pair use the same subsets.
+        participate = Uint32(Int32(tidx) - Int32(lane_first)) < Uint32(lane_count)
+    if participate:
         peer_signal_address = Int64(signals[0].toint())
         for peer in cutlass.range_constexpr(1, world_size):
             if Int32(tidx) == Int32(peer):

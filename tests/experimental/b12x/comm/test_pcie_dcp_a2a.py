@@ -304,7 +304,9 @@ def test_block_pair_barrier_selects_once_and_keeps_scaled_offsets_int64() -> Non
     from b12x.comm.pcie import _dcp_cute_common as common
 
     source = inspect.getsource(common.block_pair_barrier)
-    prefix, body = source.split("if Int32(tidx) < Int32(world_size):", maxsplit=1)
+    prefix, body = source.split("    if participate:", maxsplit=1)
+    # Default (no peer subset) keeps the original lane predicate.
+    assert "participate = Int32(tidx) < Int32(world_size)" in prefix
     assert "for peer in cutlass.range_constexpr(1, world_size):" not in prefix
     assert "for peer in cutlass.range_constexpr(1, world_size):" in body
     assert "peer_signal_address = Int64(signals[peer].toint())" in body
