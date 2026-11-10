@@ -800,6 +800,7 @@ def compile_w4a16_fused_moe(
         small_m_direct_launches=tuple(small_m_direct_launches),
         trellis_direct_lut=kernel.trellis_direct_lut,
         inkernel_route_pack=kernel.inkernel_route_pack,
+        route_pack_max_routes=kernel.route_pack_max_routes,
     )
     attach_programs(
         result, compiled, *(launch.compiled for launch in small_m_direct_launches)
@@ -1000,7 +1001,12 @@ def _w4a16_fused_moe_launch_flat(
             or route_ids.dtype != torch.int32
             or not route_ids.is_contiguous()
             or int(route_ids.numel()) != int(m) * int(topk)
-            or int(route_ids.numel()) > 128
+            or int(route_ids.numel())
+            > int(getattr(fused, "route_pack_max_routes", 128))
+            or (
+                int(getattr(fused, "route_pack_max_routes", 128)) > 128
+                and int(num_experts) > 1024
+            )
         ):
             raise ValueError("in-kernel route packing launch contract violated")
         expert_map_addr = route_ids.data_ptr()

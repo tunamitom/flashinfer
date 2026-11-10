@@ -1173,7 +1173,13 @@ def run_w4a16_moe(
         and not collect_activation_amax
         and topk_ids.dtype == torch.int32
         and topk_ids.is_contiguous()
-        and 0 < int(m) * int(topk) <= 128
+        and 0
+        < int(m) * int(topk)
+        <= int(getattr(fused_launch, "route_pack_max_routes", 128))
+        and (
+            int(getattr(fused_launch, "route_pack_max_routes", 128)) <= 128
+            or int(route_num_experts) <= 1024
+        )
         and int(route_pack_launches.block_size) == int(block_size_m)
         and packed_route_indices is not None
         and block_expert_ids is not None

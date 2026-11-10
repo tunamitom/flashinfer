@@ -105,6 +105,7 @@ class W4A16FusedMoeCompileResult:
     # B12X_TRELLIS_INKERNEL_ROUTE_PACK: the kernel can build the packed route
     # layout itself when the host passes the top-k ids (route_ids).
     inkernel_route_pack: bool = False
+    route_pack_max_routes: int = 128
 
 
 @dataclass(frozen=True)
