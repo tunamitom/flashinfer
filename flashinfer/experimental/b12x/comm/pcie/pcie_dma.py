@@ -40,6 +40,15 @@ MAX_PIECES = 8
 SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
 
+# Per-shape ring pieces for prefill reductions at world 8, measured on B+D
+# (levers/evidence/e3-shapes.log, 2026-11-10; rows 128/512/1024/2048/3072 x
+# cols 3584/7168, pieces 1/2/4/8, median of 5x20 launches). See
+# _pick_pieces for the selection rules and the override semantics.
+SHAPE_PIECES: dict[tuple[int, int], int] = {
+    (3072, 7168): 2,
+    (3072, 3584): 8,
+}
+
 
 def _eager_replay_capacities(
     max_bytes: int,
@@ -286,15 +295,37 @@ class PCIeDmaAllReduce:
     def _scratch_ptr(self, rank: int, step: int) -> int:
         return self._scratch_base[rank] + step * self.shard_capacity
 
-    def _pick_pieces(self, shard_elems: int, shard_bytes: int) -> int:
+    def _pick_pieces(
+        self, shard_elems: int, shard_bytes: int, shape: tuple[int, ...] | None = None
+    ) -> int:
         override = self._pieces_override
-        # pieces=2 measured best at every size (deeper chunking pays an
-        # extra wait+add launch chain per piece on the main stream).
-        candidates = (override,) if 1 <= override <= MAX_PIECES else (2,)
-        for pieces in candidates:
-            if shard_elems % (pieces * 8) == 0 and shard_bytes // pieces >= 512 << 10:
+
+        def usable(pieces: int) -> bool:
+            return (
+                shard_elems % (pieces * 8) == 0
+                and shard_bytes // pieces >= 512 << 10
+            )
+
+        if 1 <= override <= MAX_PIECES and usable(override):
+            return override
+        # Per-shape ring pieces (lever R2, 2026-11-10). Measured on B+D at
+        # TP8 with dig/e3-dma-ring.py's successor (levers/evidence/e3-shapes.py,
+        # log e3-shapes.log): the ring's time is stepped in shard size and the
+        # best piece count differs per reduction shape -- 8 pieces wins at
+        # (3072x3584) while (3072x7168) is fastest at 2, and pieces 8 at
+        # (3072x7168) costs 4.53 ms against 1.44 at 2. The table is keyed by
+        # the reduction shape (rows, cols) at world 8, the only shape family
+        # measured; anything else keeps the previous constant-2 behaviour.
+        # B12X_PCIE_DMA_PIECES remains a hard override (all sizes) and must
+        # never be left set: it silently wrecks prefill (see w3-results.md).
+        if shape is not None and len(shape) == 2 and self.world_size == 8:
+            pieces = SHAPE_PIECES.get((int(shape[0]), int(shape[1])))
+            if pieces is not None and usable(pieces):
                 return pieces
-        return 1
+        # pieces=2 measured best at every size before per-shape selection
+        # (deeper chunking pays an extra wait+add launch chain per piece on
+        # the main stream).
+        return 2 if usable(2) else 1
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self._closed or inp.device != self.device:
@@ -499,7 +530,7 @@ class PCIeDmaAllReduce:
         # sub-chunk c+1's copy overlaps sub-chunk c's wait+reduce. Deeper
         # chunking amortizes the flag round trip further as long as each
         # piece's copy time dominates the ~5us sub-step overhead.
-        pieces = self._pick_pieces(shard_elems, shard_bytes)
+        pieces = self._pick_pieces(shard_elems, shard_bytes, shape=tuple(inp.shape))
         if compressed_ag and (shard_elems // pieces) % FP8_QUANT_BLOCK != 0:
             pieces = 1
         piece_elems = shard_elems // pieces
