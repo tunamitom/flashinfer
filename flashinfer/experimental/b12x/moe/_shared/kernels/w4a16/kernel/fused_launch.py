@@ -51,6 +51,7 @@ from b12x.moe._shared.kernels.w4a16.kernel.direct_launch import (
 )
 from b12x.moe._shared.kernels.w4a16.kernel.fused import W4A16FusedMoeKernel
 from b12x.moe._shared.kernels.w4a16.kernel.types import W4A16FusedMoeCompileResult
+from b12x.moe._shared.kernels.w4a16.kernel.types import W4A16_FLOW_WORKSPACE_EXTRA
 
 
 _FUSED_CACHE: dict[tuple, W4A16FusedMoeCompileResult] = {}
@@ -801,6 +802,7 @@ def compile_w4a16_fused_moe(
         trellis_direct_lut=kernel.trellis_direct_lut,
         inkernel_route_pack=kernel.inkernel_route_pack,
         route_pack_max_routes=kernel.route_pack_max_routes,
+        flow_flags=kernel.flow_flags,
     )
     attach_programs(
         result, compiled, *(launch.compiled for launch in small_m_direct_launches)
@@ -982,6 +984,14 @@ def _w4a16_fused_moe_launch_flat(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
     )
+    if bool(getattr(fused, "flow_flags", False)) and int(workspace.numel()) < (
+        int(sms) * 4 + 2 + W4A16_FLOW_WORKSPACE_EXTRA
+    ):
+        raise ValueError(
+            "B12X_TRELLIS_FLOW_FLAGS kernel needs kernel_workspace >= "
+            f"{int(sms) * 4 + 2 + W4A16_FLOW_WORKSPACE_EXTRA} int32 "
+            f"(got {int(workspace.numel())}); plan the workspace with the flag set"
+        )
     weight_cutlass_dtype = (
         cutlass.Uint8 if weight_layout == "modelopt" else cutlass.Int32
     )

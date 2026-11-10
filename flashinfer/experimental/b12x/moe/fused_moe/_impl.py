@@ -167,6 +167,16 @@ _W13_LAYOUTS = {
 _DEVICE_CAPABILITY_CACHE: dict[int, tuple[int, int]] = {}
 
 
+def _w4a16_flow_workspace_extra() -> int:
+    """kernel_workspace words added for B12X_TRELLIS_FLOW_FLAGS (0 when off)."""
+    from b12x.moe._shared.kernels.w4a16.kernel.types import (
+        W4A16_FLOW_WORKSPACE_EXTRA,
+        w4a16_flow_flags_requested,
+    )
+
+    return W4A16_FLOW_WORKSPACE_EXTRA if w4a16_flow_flags_requested() else 0
+
+
 def _current_compute_capability() -> tuple[int, int] | None:
     """Return the active CUDA device capability without repeated driver queries."""
 
@@ -3624,7 +3634,7 @@ def _plan_core_workspace(
                 ),
                 _TensorAllocSpec(
                     "kernel_workspace",
-                    (sms * 4 + 2,),
+                    (sms * 4 + 2 + _w4a16_flow_workspace_extra(),),
                     torch.int32,
                     init="zeros",
                 ),
@@ -3877,7 +3887,11 @@ def _plan_core_workspace(
                         ),
                         torch.float16,
                     ),
-                    _TensorAllocSpec("kernel_workspace", (sms * 4 + 2,), torch.int32),
+                    _TensorAllocSpec(
+                        "kernel_workspace",
+                        (sms * 4 + 2 + _w4a16_flow_workspace_extra(),),
+                        torch.int32,
+                    ),
                 )
             )
             if not intermediate_hadamard:

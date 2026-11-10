@@ -35,6 +35,8 @@ from b12x._lib.intrinsics.memory import st_global_v4_u32
 from b12x._lib.intrinsics.atomics import st_shared_f32
 from b12x._lib.intrinsics.atomics import ld_shared_i32
 from b12x._lib.intrinsics.atomics import st_shared_i32
+from b12x.moe._shared.kernels.w4a16.kernel.types import W4A16_FLOW_LIVE_BLOCKS
+from b12x.moe._shared.kernels.w4a16.kernel.types import W4A16_FLOW_MAX_BLOCKS
 from b12x._lib.intrinsics.atomics import atomic_add_shared_i32
 from b12x._lib.intrinsics.memory import st_shared_v4_u32
 from b12x._lib.intrinsics.sync import threadfence
@@ -546,6 +548,55 @@ class W4A16FusedMoeKernel:
             self.fc2.lut_e4m3_smem = True
         self.barrier_count_off = self.sms * 4
         self.barrier_sense_off = self.sms * 4 + 1
+        # Opt-in (B12X_TRELLIS_FLOW_FLAGS=1): replace grid barriers 2 and 3 by
+        # per-route-block dependency counters.  FC1's final split-K slice of a
+        # tile adds 1 to fc1_ctr[block]; an activation unit waits for
+        # fc1_ctr[block] == FC1 n-tiles, then adds 1 to act_ctr[block]; an FC2
+        # piece waits for act_ctr[block] == BS * I/128.  Counters live in a
+        # planner-allocated workspace extension (W4A16_FLOW_WORKSPACE_EXTRA)
+        # after the barrier words.  All flow state (counters and every
+        # split-K lock slot, FC2 locks moved to [2*sms, 3*sms + 8)) is zeroed
+        # cooperatively before grid barrier 1, so nothing depends on what a
+        # previous launch or another kernel sharing the scratch arena left
+        # there.  Deadlock-free on the cooperative grid: no CTA waits before
+        # finishing its own FC1 work, and activation never waits on FC2.
+        # Same arithmetic -> bit-identical output.
+        self.flow_seq_off = self.sms * 4 + 2
+        self.flow_ctr_off = self.flow_seq_off + 4
+        # Lock words zeroed at entry: FC1 slots [0, 2*sms) and the moved FC2
+        # slots [2*sms, 3*sms + 8) (lock_slot <= grid_x + 2 <= sms + 2).
+        self.flow_lock_words = 3 * self.sms + 8
+        self.flow_max_blocks = W4A16_FLOW_MAX_BLOCKS
+        self.flow_live_blocks = min(W4A16_FLOW_LIVE_BLOCKS, W4A16_FLOW_MAX_BLOCKS)
+        self.flow_flags = (
+            os.environ.get("B12X_TRELLIS_FLOW_FLAGS", "0") == "1"
+            and self.full_rotation
+            and self.intermediate_hadamard
+            and self.activation_is_gated
+            and not self.direct_topk_routes
+            and not self.use_expert_map
+            and not self.collect_activation_amax
+            and not self.zero_fc2_output
+            and not self.tc_decode_fused_sum
+            and not self.prefill_fused_sum_fp32
+            and self.fc1_trellis_pair_kind is None
+            and self.fc1.schedule_route_block_factor == 1
+            and self.fc2.schedule_route_block_factor == 1
+            and not self.fc1.schedule_whole_tiles
+            and not self.fc2.schedule_whole_tiles
+            and self.intermediate_size % 128 == 0
+        )
+        if self.flow_flags:
+            for gemm_kernel, role in ((self.fc1, 1), (self.fc2, 2)):
+                gemm_kernel.flow_role = role
+                gemm_kernel.flow_seq_off = self.flow_seq_off
+                gemm_kernel.flow_ctr_off = self.flow_ctr_off
+                gemm_kernel.flow_max_blocks = self.flow_max_blocks
+                gemm_kernel.flow_live_blocks = self.flow_live_blocks
+            self.fc2.flow_lock_offset = 2 * self.sms
+            self.fc2.flow_act_target = self.moe_block_size * (
+                self.intermediate_size // 128
+            )
         # The cooperative launch must admit blocks_per_sm CTAs on every SM.
         if self.fc1.weight_layout_block:
             self.smem_carveout = 100
@@ -608,6 +659,7 @@ class W4A16FusedMoeKernel:
             self.trellis_direct_lut,
             self.inkernel_route_pack,
             self.route_pack_hist,
+            self.flow_flags,
             self.small_m_splitk,
             self.fc1.__cache_key__,
             self.fc2.__cache_key__,
@@ -1277,7 +1329,34 @@ class W4A16FusedMoeKernel:
                     grid_x,
                     active_m,
                 )
+            if cutlass.const_expr(self.flow_flags):
+                # Cooperative init: zero every split-K lock slot (FC1 and the
+                # moved FC2 range) and the dependency counters before grid
+                # barrier 1. Nothing reads or writes them before that barrier,
+                # and the barrier publishes the zeros to all CTAs, so the flow
+                # state never depends on what earlier launches or other
+                # kernels sharing the scratch arena left in these words.
+                zi = cta * Int32(self.cta_threads) + tid
+                if zi < Int32(self.flow_lock_words):
+                    st_global_i32(get_ptr_as_int64(locks_i32_flat, zi), Int32(0))
+                elif zi < Int32(self.flow_lock_words + 2 * self.flow_max_blocks):
+                    st_global_i32(
+                        get_ptr_as_int64(
+                            locks_i32_flat,
+                            Int32(self.flow_ctr_off - self.flow_lock_words) + zi,
+                        ),
+                        Int32(0),
+                    )
             self._grid_barrier(locks_i32_flat, tid, grid_x)
+        flow_live = Int32(0)
+        flow_ctr = Int64(0)
+        if cutlass.const_expr(self.flow_flags):
+            route_blocks_now = packed_route_count[Int32(0)].to(Int32) // Int32(
+                self.moe_block_size
+            )
+            if route_blocks_now <= Int32(self.flow_live_blocks):
+                flow_live = Int32(1)
+            flow_ctr = get_ptr_as_int64(locks_i32_flat, Int32(self.flow_ctr_off))
         if cutlass.const_expr(
             (self.tc_decode_fused_sum and self.weight_layout not in BLOCK_CODECS)
             or self.prefill_fused_sum_fp32
@@ -1330,7 +1409,11 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
             )
-            self._grid_barrier(locks_i32_flat, tid, grid_x)
+            if cutlass.const_expr(self.flow_flags):
+                if flow_live == Int32(0):
+                    self._grid_barrier(locks_i32_flat, tid, grid_x)
+            else:
+                self._grid_barrier(locks_i32_flat, tid, grid_x)
             if cutlass.const_expr(self.full_rotation):
                 if cutlass.const_expr(self.intermediate_hadamard):
                     self._run_activation_intermediate_hadamard(
@@ -1347,6 +1430,8 @@ class W4A16FusedMoeKernel:
                         cta,
                         grid_x,
                         active_m,
+                        flow_live,
+                        flow_ctr,
                     )
                 else:
                     self._run_activation_compact(
@@ -1396,7 +1481,11 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
             )
-        self._grid_barrier(locks_i32_flat, tid, grid_x)
+        if cutlass.const_expr(self.flow_flags):
+            if flow_live == Int32(0):
+                self._grid_barrier(locks_i32_flat, tid, grid_x)
+        else:
+            self._grid_barrier(locks_i32_flat, tid, grid_x)
         if cutlass.const_expr(self.collect_activation_amax):
             self._collect_activation_amax_epilogue(
                 a_bf16_flat,
@@ -2065,6 +2154,8 @@ class W4A16FusedMoeKernel:
         cta: Int32,
         grid_x: Int32,
         active_m: cutlass.Int32,
+        flow_live: Int32,
+        flow_ctr: Int64,
     ):
         """Recover interleaved gate/up, evaluate SiTU, and prepare FC2."""
 
@@ -2083,6 +2174,16 @@ class W4A16FusedMoeKernel:
         while unit < total_units:
             route_pos = unit // nblk
             post_block = unit - route_pos * nblk
+            if cutlass.const_expr(self.flow_flags):
+                if flow_live != Int32(0):
+                    # Wait for every FC1 n-tile of this route block (every
+                    # lane acquires, so its own FC1 loads are ordered).
+                    fc1_addr = flow_ctr + Int64(
+                        route_pos // Int32(self.moe_block_size)
+                    ) * Int64(4)
+                    got = Int32(-1)
+                    while got != Int32(self.fc1.n_tiles):
+                        got = ld_global_acquire_i32(fc1_addr)
             row = packed_route_indices[route_pos].to(Int32)
             expert = block_expert_ids[route_pos // Int32(self.moe_block_size)].to(Int32)
             if cutlass.const_expr(self.direct_topk_routes):
@@ -2178,6 +2279,20 @@ class W4A16FusedMoeKernel:
                 activated_flat[out_base + Int32(1)] = self._cast_elem(v1)
                 activated_flat[out_base + Int32(2)] = self._cast_elem(v2)
                 activated_flat[out_base + Int32(3)] = self._cast_elem(v3)
+            if cutlass.const_expr(self.flow_flags):
+                if flow_live != Int32(0):
+                    threadfence()
+                    cute.arch.sync_warp()
+                    if (tid & Int32(31)) == Int32(0):
+                        red_add_global_release_i32(
+                            flow_ctr
+                            + Int64(
+                                self.flow_max_blocks
+                                + route_pos // Int32(self.moe_block_size)
+                            )
+                            * Int64(4),
+                            Int32(1),
+                        )
             unit += gw_stride
 
     @cute.jit
