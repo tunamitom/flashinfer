@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 
 from b12x._lib.compile_plan import attach_programs
@@ -48,6 +49,18 @@ _PREPARED_LSE_LAUNCHERS: set[tuple[object, ...]] = set()
 _PREPARED_GATHER_LAUNCHERS: set[tuple[object, ...]] = set()
 _PREPARED_PAIR_LAUNCHERS: set[tuple[object, ...]] = set()
 _PREPARED_KIMI_TOPK_LAUNCHERS: set[int] = set()
+
+# Opt-in multi-CTA PUSH transport for the paired (route) gather: one CTA per
+# row writes its row into every peer's staging (posted writes) and reads only
+# local memory after the per-CTA barrier.  The default pull transport (one CTA,
+# non-posted peer reads) is unchanged when this is unset or "0".
+PAIR_PUSH_ENV = "B12X_PCIE_DCP_PAIR_PUSH"
+PAIR_PUSH_MAX_ROWS = 8
+
+
+def pair_push_enabled() -> bool:
+    """Read the paired-gather push switch (plan/compile time, default off)."""
+    return os.environ.get(PAIR_PUSH_ENV, "0").strip() not in ("", "0")
 
 
 @dsl_user_op
@@ -1212,9 +1225,11 @@ class _AllGatherPairLaunch(_DCPA2ABase):
         threads: int,
         device_slot_selection: bool,
         kimi_topk: bool,
+        push: bool = False,
     ) -> None:
         super().__init__(world_size, rank, threads, device_slot_selection)
         self._kimi_topk = bool(kimi_topk)
+        self._push = bool(push)
 
     @cute.jit
     def __call__(
@@ -1307,7 +1322,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             second_packs,
             slot_delta_256b,
         ).launch(
-            grid=(1, 1, 1),
+            grid=(batch if self._push else 1, 1, 1),
             block=(self._threads, 1, 1),
             max_number_threads=(512, 1, 1),
             min_blocks_per_mp=1,
@@ -1398,6 +1413,9 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             signal15,
         )
         tidx, _, _ = cute.arch.thread_idx()
+        if cutlass.const_expr(self._push):
+            push_row_index, _, _ = cute.arch.block_idx()
+            push_row = Int32(push_row_index)
         slot_offset = Int64(0)
         if cutlass.const_expr(self._device_slot_selection):
             generation = ld_relaxed_gpu_u32(
@@ -1406,117 +1424,130 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             slot = generation % Uint32(2)
             slot_offset = Int64(slot) * Int64(slot_delta_256b) * Int64(_SLOT_ALIGNMENT)
         combined_packs = first_packs + second_packs
-        local_stage = self._staging_words(staging[self._rank] + slot_offset)
-
-        linear = Int32(tidx)
-        while linear < batch * first_packs:
-            batch_index = linear // first_packs
-            pack = linear - batch_index * first_packs
-            _copy_16b(
-                local_first + Int64(linear) * Int64(4),
-                local_stage
-                + (Int64(batch_index) * Int64(combined_packs) + Int64(pack)) * Int64(4),
+        if cutlass.const_expr(self._push):
+            self._push_exchange(
+                local_first,
+                local_second,
+                output_first,
+                output_second,
+                staging,
+                signals,
+                slot_offset,
+                first_packs,
+                second_packs,
             )
-            linear += Int32(self._threads)
-        linear = Int32(tidx)
-        while linear < batch * second_packs:
-            batch_index = linear // second_packs
-            pack = linear - batch_index * second_packs
-            _copy_16b(
-                local_second + Int64(linear) * Int64(4),
-                local_stage
-                + (
-                    Int64(batch_index) * Int64(combined_packs)
-                    + Int64(first_packs)
-                    + Int64(pack)
-                )
-                * Int64(4),
-            )
-            linear += Int32(self._threads)
+        else:
+            local_stage = self._staging_words(staging[self._rank] + slot_offset)
 
-        block_pair_barrier(
-            signals,
-            self_signal=signals[self._rank],
-            rank=self._rank,
-            world_size=self._world_size,
-            max_blocks=_MAX_BLOCKS,
-        )
-
-        first_output_packs = batch * Int32(self._world_size) * first_packs
-        linear = Int32(tidx)
-        while linear < first_output_packs:
-            batch_index = linear // (Int32(self._world_size) * first_packs)
-            row_pack = linear - (batch_index * Int32(self._world_size) * first_packs)
-            source_rank = row_pack // first_packs
-            pack = row_pack - source_rank * first_packs
-            # Default to this rank's own slice so the address is always
-            # mappable; the chain below always overwrites it, because
-            # source_rank is derived from row_pack and is in range.
-            source_address = Int64(
-                (
-                    local_first
-                    + (Int64(batch_index) * Int64(first_packs) + Int64(pack)) * Int64(4)
-                ).toint()
-            )
-            for source in cutlass.range_constexpr(self._world_size):
-                if source_rank == Int32(source):
-                    if cutlass.const_expr(source == self._rank):
-                        source_words = local_first
-                        source_base = Int64(batch_index) * Int64(first_packs)
-                    else:
-                        source_words = self._staging_words(
-                            staging[source] + slot_offset
-                        )
-                        source_base = Int64(batch_index) * Int64(combined_packs)
-                    source_address = Int64(
-                        (source_words + (source_base + Int64(pack)) * Int64(4)).toint()
-                    )
-            _copy_16b_addr(
-                source_address,
-                Int64((output_first + Int64(linear) * Int64(4)).toint()),
-            )
-            linear += Int32(self._threads)
-
-        if cutlass.const_expr(not self._kimi_topk):
-            second_output_packs = batch * Int32(self._world_size) * second_packs
             linear = Int32(tidx)
-            while linear < second_output_packs:
-                batch_index = linear // (Int32(self._world_size) * second_packs)
-                row_pack = linear - (
-                    batch_index * Int32(self._world_size) * second_packs
+            while linear < batch * first_packs:
+                batch_index = linear // first_packs
+                pack = linear - batch_index * first_packs
+                _copy_16b(
+                    local_first + Int64(linear) * Int64(4),
+                    local_stage
+                    + (Int64(batch_index) * Int64(combined_packs) + Int64(pack)) * Int64(4),
                 )
-                source_rank = row_pack // second_packs
-                pack = row_pack - source_rank * second_packs
+                linear += Int32(self._threads)
+            linear = Int32(tidx)
+            while linear < batch * second_packs:
+                batch_index = linear // second_packs
+                pack = linear - batch_index * second_packs
+                _copy_16b(
+                    local_second + Int64(linear) * Int64(4),
+                    local_stage
+                    + (
+                        Int64(batch_index) * Int64(combined_packs)
+                        + Int64(first_packs)
+                        + Int64(pack)
+                    )
+                    * Int64(4),
+                )
+                linear += Int32(self._threads)
+
+            block_pair_barrier(
+                signals,
+                self_signal=signals[self._rank],
+                rank=self._rank,
+                world_size=self._world_size,
+                max_blocks=_MAX_BLOCKS,
+            )
+
+            first_output_packs = batch * Int32(self._world_size) * first_packs
+            linear = Int32(tidx)
+            while linear < first_output_packs:
+                batch_index = linear // (Int32(self._world_size) * first_packs)
+                row_pack = linear - (batch_index * Int32(self._world_size) * first_packs)
+                source_rank = row_pack // first_packs
+                pack = row_pack - source_rank * first_packs
+                # Default to this rank's own slice so the address is always
+                # mappable; the chain below always overwrites it, because
+                # source_rank is derived from row_pack and is in range.
                 source_address = Int64(
                     (
-                        local_second
-                        + (Int64(batch_index) * Int64(second_packs) + Int64(pack))
-                        * Int64(4)
+                        local_first
+                        + (Int64(batch_index) * Int64(first_packs) + Int64(pack)) * Int64(4)
                     ).toint()
                 )
                 for source in cutlass.range_constexpr(self._world_size):
                     if source_rank == Int32(source):
                         if cutlass.const_expr(source == self._rank):
-                            source_words = local_second
-                            source_base = Int64(batch_index) * Int64(second_packs)
+                            source_words = local_first
+                            source_base = Int64(batch_index) * Int64(first_packs)
                         else:
                             source_words = self._staging_words(
                                 staging[source] + slot_offset
                             )
-                            source_base = Int64(batch_index) * Int64(
-                                combined_packs
-                            ) + Int64(first_packs)
+                            source_base = Int64(batch_index) * Int64(combined_packs)
                         source_address = Int64(
-                            (
-                                source_words + (source_base + Int64(pack)) * Int64(4)
-                            ).toint()
+                            (source_words + (source_base + Int64(pack)) * Int64(4)).toint()
                         )
                 _copy_16b_addr(
                     source_address,
-                    Int64((output_second + Int64(linear) * Int64(4)).toint()),
+                    Int64((output_first + Int64(linear) * Int64(4)).toint()),
                 )
                 linear += Int32(self._threads)
-        else:
+
+            if cutlass.const_expr(not self._kimi_topk):
+                second_output_packs = batch * Int32(self._world_size) * second_packs
+                linear = Int32(tidx)
+                while linear < second_output_packs:
+                    batch_index = linear // (Int32(self._world_size) * second_packs)
+                    row_pack = linear - (
+                        batch_index * Int32(self._world_size) * second_packs
+                    )
+                    source_rank = row_pack // second_packs
+                    pack = row_pack - source_rank * second_packs
+                    source_address = Int64(
+                        (
+                            local_second
+                            + (Int64(batch_index) * Int64(second_packs) + Int64(pack))
+                            * Int64(4)
+                        ).toint()
+                    )
+                    for source in cutlass.range_constexpr(self._world_size):
+                        if source_rank == Int32(source):
+                            if cutlass.const_expr(source == self._rank):
+                                source_words = local_second
+                                source_base = Int64(batch_index) * Int64(second_packs)
+                            else:
+                                source_words = self._staging_words(
+                                    staging[source] + slot_offset
+                                )
+                                source_base = Int64(batch_index) * Int64(
+                                    combined_packs
+                                ) + Int64(first_packs)
+                            source_address = Int64(
+                                (
+                                    source_words + (source_base + Int64(pack)) * Int64(4)
+                                ).toint()
+                            )
+                    _copy_16b_addr(
+                        source_address,
+                        Int64((output_second + Int64(linear) * Int64(4)).toint()),
+                    )
+                    linear += Int32(self._threads)
+        if cutlass.const_expr(self._kimi_topk):
             smem_alloc = cutlass.utils.SmemAllocator()
 
             @cute.struct
@@ -1551,12 +1582,36 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             while router_pack < router_packs_total:
                 source_rank = router_pack // second_packs
                 pack = router_pack - source_rank * second_packs
-                source_address = Int64((local_second + Int64(pack) * Int64(4)).toint())
+                if cutlass.const_expr(self._push):
+                    source_address = Int64(
+                        (
+                            local_second
+                            + (Int64(push_row) * Int64(second_packs) + Int64(pack))
+                            * Int64(4)
+                        ).toint()
+                    )
+                else:
+                    source_address = Int64(
+                        (local_second + Int64(pack) * Int64(4)).toint()
+                    )
                 for source in cutlass.range_constexpr(self._world_size):
                     if source_rank == Int32(source):
                         if cutlass.const_expr(source == self._rank):
                             source_words = local_second
-                            source_base = Int64(0)
+                            if cutlass.const_expr(self._push):
+                                source_base = Int64(push_row) * Int64(second_packs)
+                            else:
+                                source_base = Int64(0)
+                        elif cutlass.const_expr(self._push):
+                            # Pushed rows live in this rank's own staging:
+                            # [row][source slot (peers only)][first|second].
+                            source_words = self._staging_words(
+                                staging[self._rank] + slot_offset
+                            )
+                            source_base = (
+                                Int64(push_row) * Int64(self._world_size - 1)
+                                + Int64(source if source < self._rank else source - 1)
+                            ) * Int64(first_packs + second_packs) + Int64(first_packs)
                         else:
                             source_words = self._staging_words(
                                 staging[source] + slot_offset
@@ -1679,23 +1734,176 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 weight_sum = two[0] + two[1]
             if Int32(tidx) == Int32(0):
                 scale = Float32(1.0) / (weight_sum + Float32(1.0e-20))
+                row_out = Int64(0)
+                if cutlass.const_expr(self._push):
+                    row_out = Int64(push_row) * Int64(16)
                 for selected in cutlass.range_constexpr(16):
                     cute.arch.store(
-                        output_second + Int64(selected),
+                        output_second + row_out + Int64(selected),
                         selected_weights[selected] * scale,
                     )
                     cute.arch.store(
-                        output_ids + Int64(selected), selected_ids[selected]
+                        output_ids + row_out + Int64(selected), selected_ids[selected]
                     )
 
         if cutlass.const_expr(self._device_slot_selection):
             if Int32(tidx) == Int32(0):
                 self_signal = signals[self._rank]
-                _a2a_graph_epoch_arrive(
-                    (self_signal + Int64(_GRAPH_EPOCH_INDEX)).toint(),
-                    (self_signal + Int64(_GRAPH_ARRIVED_INDEX)).toint(),
-                    Uint32(1),
+                if cutlass.const_expr(self._push):
+                    push_grid, _, _ = cute.arch.grid_dim()
+                    _a2a_graph_epoch_arrive(
+                        (self_signal + Int64(_GRAPH_EPOCH_INDEX)).toint(),
+                        (self_signal + Int64(_GRAPH_ARRIVED_INDEX)).toint(),
+                        Uint32(push_grid),
+                    )
+                else:
+                    _a2a_graph_epoch_arrive(
+                        (self_signal + Int64(_GRAPH_EPOCH_INDEX)).toint(),
+                        (self_signal + Int64(_GRAPH_ARRIVED_INDEX)).toint(),
+                        Uint32(1),
+                    )
+
+
+    @cute.jit
+    def _push_exchange(
+        self,
+        local_first,
+        local_second,
+        output_first,
+        output_second,
+        staging,
+        signals,
+        slot_offset,
+        first_packs,
+        second_packs,
+    ):
+        """One CTA per row: push this rank's row to every peer, barrier, then
+        assemble the rank-major row from local memory only.
+
+        Receiver staging layout per slot: ``[row][source slot][first|second]``
+        where the source slot skips the receiver (``W - 1`` slots).  CTA ``b``
+        on every rank handles row ``b``, so the per-CTA pair barrier orders
+        exactly the writes that CTA ``b`` reads afterwards.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        row = Int32(bidx)
+        combined_packs = first_packs + second_packs
+        peers = Int64(self._world_size - 1)
+        own_stage = self._staging_words(staging[self._rank] + slot_offset)
+
+        linear = Int32(tidx)
+        while linear < combined_packs:
+            source_address = Int64(
+                (
+                    local_first
+                    + (Int64(row) * Int64(first_packs) + Int64(linear)) * Int64(4)
+                ).toint()
+            )
+            if linear >= first_packs:
+                source_address = Int64(
+                    (
+                        local_second
+                        + (
+                            Int64(row) * Int64(second_packs)
+                            + Int64(linear - first_packs)
+                        )
+                        * Int64(4)
+                    ).toint()
                 )
+            values = ld_global_v4_u32(source_address)
+            for peer in cutlass.range_constexpr(self._world_size):
+                if cutlass.const_expr(peer != self._rank):
+                    staged_pack = (
+                        Int64(row) * peers
+                        + Int64(self._rank if self._rank < peer else self._rank - 1)
+                    ) * Int64(combined_packs) + Int64(linear)
+                    st_global_v4_u32(
+                        (
+                            self._staging_words(staging[peer] + slot_offset)
+                            + staged_pack * Int64(4)
+                        ).toint(),
+                        *values,
+                    )
+            linear += Int32(self._threads)
+
+        block_pair_barrier(
+            signals,
+            self_signal=signals[self._rank],
+            rank=self._rank,
+            world_size=self._world_size,
+            max_blocks=_MAX_BLOCKS,
+        )
+        # Acquire the peers' pushed rows before reading them locally.
+        if Int32(tidx) == Int32(0):
+            _membar_sys()
+        cute.arch.sync_threads()
+
+        row_first = Int32(self._world_size) * first_packs
+        linear = Int32(tidx)
+        while linear < row_first:
+            source_rank = linear // first_packs
+            pack = linear - source_rank * first_packs
+            source_address = Int64(
+                (
+                    local_first
+                    + (Int64(row) * Int64(first_packs) + Int64(pack)) * Int64(4)
+                ).toint()
+            )
+            for source in cutlass.range_constexpr(self._world_size):
+                if cutlass.const_expr(source != self._rank):
+                    if source_rank == Int32(source):
+                        staged_pack = (
+                            Int64(row) * peers
+                            + Int64(source if source < self._rank else source - 1)
+                        ) * Int64(combined_packs) + Int64(pack)
+                        source_address = Int64(
+                            (own_stage + staged_pack * Int64(4)).toint()
+                        )
+            _copy_16b_addr(
+                source_address,
+                Int64(
+                    (
+                        output_first
+                        + (Int64(row) * Int64(row_first) + Int64(linear)) * Int64(4)
+                    ).toint()
+                ),
+            )
+            linear += Int32(self._threads)
+
+        if cutlass.const_expr(not self._kimi_topk):
+            row_second = Int32(self._world_size) * second_packs
+            linear = Int32(tidx)
+            while linear < row_second:
+                source_rank = linear // second_packs
+                pack = linear - source_rank * second_packs
+                source_address = Int64(
+                    (
+                        local_second
+                        + (Int64(row) * Int64(second_packs) + Int64(pack)) * Int64(4)
+                    ).toint()
+                )
+                for source in cutlass.range_constexpr(self._world_size):
+                    if cutlass.const_expr(source != self._rank):
+                        if source_rank == Int32(source):
+                            staged_pack = (
+                                Int64(row) * peers
+                                + Int64(source if source < self._rank else source - 1)
+                            ) * Int64(combined_packs) + Int64(first_packs + pack)
+                            source_address = Int64(
+                                (own_stage + staged_pack * Int64(4)).toint()
+                            )
+                _copy_16b_addr(
+                    source_address,
+                    Int64(
+                        (
+                            output_second
+                            + (Int64(row) * Int64(row_second) + Int64(linear))
+                            * Int64(4)
+                        ).toint()
+                    ),
+                )
+                linear += Int32(self._threads)
 
 
 class _KimiTopK16Launch:
@@ -2139,15 +2347,18 @@ def _pair_launcher_key(
     threads: int,
     device_slot_selection: bool,
     kimi_topk: bool,
+    push: bool = False,
 ) -> tuple[object, ...]:
     """Return the cache key for a paired all-gather launcher."""
-    return (
+    key = (
         int(world_size),
         int(rank),
         int(threads),
         bool(device_slot_selection),
         bool(kimi_topk),
     )
+    # The default pull transport keeps its historical key exactly.
+    return key + ("push",) if push else key
 
 
 def is_all_gather_pair_prepared(
@@ -2156,6 +2367,7 @@ def is_all_gather_pair_prepared(
     threads: int,
     device_slot_selection: bool,
     kimi_topk: bool = False,
+    push: bool | None = None,
 ) -> bool:
     return (
         _pair_launcher_key(
@@ -2164,6 +2376,7 @@ def is_all_gather_pair_prepared(
             threads,
             device_slot_selection,
             kimi_topk,
+            pair_push_enabled() if push is None else push,
         )
         in _PREPARED_PAIR_LAUNCHERS
     )
@@ -2176,6 +2389,7 @@ def _get_compiled_all_gather_pair(
     threads: int,
     device_slot_selection: bool,
     kimi_topk: bool = False,
+    push: bool = False,
 ) -> Callable:
     """Compile and retain one paired all-gather launcher specialization."""
     launch = _AllGatherPairLaunch(
@@ -2184,6 +2398,7 @@ def _get_compiled_all_gather_pair(
         threads,
         device_slot_selection,
         kimi_topk,
+        push,
     )
     key = _pair_launcher_key(
         world_size,
@@ -2191,6 +2406,7 @@ def _get_compiled_all_gather_pair(
         threads,
         device_slot_selection,
         kimi_topk,
+        push,
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
@@ -2226,7 +2442,8 @@ def _get_compiled_all_gather_pair(
                 "threads",
                 "device_slot_selection",
                 "kimi_topk",
-            ),
+            )
+            + (("transport",) if push else ()),
         ),
     )
 
@@ -2455,15 +2672,17 @@ def all_gather_pair(
         raise ValueError("paired DCP rows must be multiples of 16 bytes")
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     if launcher is None:
+        push = pair_push_enabled()
         launcher = _get_compiled_all_gather_pair(
             world_size,
             rank,
             threads,
             device_slot_selection,
             False,
+            push,
         )
         if not device_slot_selection:
-            _get_compiled_all_gather_pair(world_size, rank, threads, True, False)
+            _get_compiled_all_gather_pair(world_size, rank, threads, True, False, push)
     launcher(
         local_first_ptr,
         local_second_ptr,
@@ -2495,18 +2714,21 @@ def all_gather_pair_kimi_topk(
     device_slot_selection: bool,
     slot_delta_bytes: int,
     launcher: Callable | None = None,
+    rows: int = 1,
 ) -> None:
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     if launcher is None:
+        push = pair_push_enabled()
         launcher = _get_compiled_all_gather_pair(
             world_size,
             rank,
             512,
             device_slot_selection,
             True,
+            push,
         )
         if not device_slot_selection:
-            _get_compiled_all_gather_pair(world_size, rank, 512, True, True)
+            _get_compiled_all_gather_pair(world_size, rank, 512, True, True, push)
     launcher(
         local_down_ptr,
         local_router_ptr,
@@ -2516,7 +2738,7 @@ def all_gather_pair_kimi_topk(
         topk_ids_ptr,
         staging_ptrs,
         signal_ptrs,
-        1,
+        int(rows),
         448 // world_size,
         224 // world_size,
         slot_delta_256b,
