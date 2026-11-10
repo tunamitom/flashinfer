@@ -41,12 +41,26 @@ SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
 
 # Per-shape ring pieces for prefill reductions at world 8, measured on B+D
-# (levers/evidence/e3-shapes.log, 2026-11-10; rows 128/512/1024/2048/3072 x
-# cols 3584/7168, pieces 1/2/4/8, median of 5x20 launches). See
-# _pick_pieces for the selection rules and the override semantics.
+# (levers/evidence/bd-window-*.log + extension, 2026-11-10; every shape in
+# prefill_capacities(3072) x {3584, 7168} cols, pieces 1/2/4/8, median of
+# 5x20 launches). The ring's time is stepped and pieces matter per shape:
+# pieces 1 wins everywhere except the two largest 7168-col reductions
+# (2560x7168: 1.207 ms at 2 vs 1.367 at 1; 3072x7168: 1.436 vs 1.637). At the
+# 3584-col shapes 1 piece is 25-48% faster than 2 (3072x3584: 0.891 vs 1.185;
+# 2048x3584: 0.645 vs 1.187). The dig's "0.88 ms at 8 pieces" for
+# (3072x3584) was this same 1-piece path: the 512 KiB minimum piece size makes
+# the old constant-2 (and any deep override) fall back to 1 there. pieces=1
+# also halves graph-node cost (128 KiB vs 224 KiB per launch, K=64 capture).
+# See _pick_pieces for the selection rules and the override semantics.
 SHAPE_PIECES: dict[tuple[int, int], int] = {
-    (3072, 7168): 2,
-    (3072, 3584): 8,
+    (128, 3584): 1, (128, 7168): 1,
+    (256, 3584): 1, (256, 7168): 1,
+    (512, 3584): 1, (512, 7168): 1,
+    (1024, 3584): 1, (1024, 7168): 1,
+    (1536, 3584): 1, (1536, 7168): 1,
+    (2048, 3584): 1, (2048, 7168): 1,
+    (2560, 3584): 1, (2560, 7168): 2,
+    (3072, 3584): 1, (3072, 7168): 2,
 }
 
 
