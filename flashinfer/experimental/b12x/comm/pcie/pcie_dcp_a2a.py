@@ -53,6 +53,11 @@ _SIGNAL_BYTES = (
 
 
 PAIR_PUSH_MAX_ROWS = 8  # fused Kimi top-16 rows (one CTA per row)
+# The standalone Kimi top-16 runs one CTA per row (grid = rows) and selects
+# every row independently, so 9..16 rows (for example two concurrent
+# speculative streams) produce the same bytes per row as 1..8 rows. Callers
+# that never pass more than eight rows are unaffected.
+KIMI_TOPK16_MAX_ROWS = 16
 PAIR_PUSH_MAX_BLOCKS = 64  # per-CTA barrier records (_dcp_a2a_cute._MAX_BLOCKS)
 
 
@@ -99,15 +104,17 @@ def kimi_topk16(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select Kimi-K3's 16 routed experts with prepared native code.
 
-    The operation accepts one to eight assembled FP32 router rows. It launches
+    The operation accepts one to sixteen assembled FP32 router rows. It launches
     on the current CUDA stream and is CUDA-graph safe with caller-owned outputs.
     """
 
     if router_logits.ndim != 2:
         raise ValueError("router_logits must be a contiguous rank-2 tensor")
     rows = int(router_logits.shape[0])
-    if rows < 1 or rows > 8:
-        raise ValueError(f"Kimi top-16 rows {rows} must be between 1 and 8")
+    if rows < 1 or rows > KIMI_TOPK16_MAX_ROWS:
+        raise ValueError(
+            f"Kimi top-16 rows {rows} must be between 1 and {KIMI_TOPK16_MAX_ROWS}"
+        )
     device = router_logits.device
     if device.type != "cuda":
         raise ValueError("Kimi top-16 requires CUDA tensors")
@@ -1515,7 +1522,11 @@ class PCIeDCPA2A:
     ):
         self._check_stream()
         rows = int(router_logits.shape[0]) if router_logits.ndim == 2 else 0
-        if self._closed or rows <= 0 or rows > min(self.max_batch_size, 8):
+        if (
+            self._closed
+            or rows <= 0
+            or rows > min(self.max_batch_size, KIMI_TOPK16_MAX_ROWS)
+        ):
             raise ValueError("Kimi top-16 rows exceed prepared channel capacity")
         for value, shape, dtype, name in (
             (router_logits, (rows, 896), torch.float32, "router_logits"),
