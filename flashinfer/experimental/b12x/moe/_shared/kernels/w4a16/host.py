@@ -212,6 +212,47 @@ def select_route_block_size_m(m: int, topk: int, num_experts: int) -> int:
     return _W4A16_ALLOWED_ROUTED_SIZES[-1]
 
 
+# Measured Trellis prefill launch shapes. All variants are bit-identical to
+# the stock output. Three effects, mapped per token count M (only prefill
+# sizes >= 128 are touched; every decode/batch launch stays on the shipped
+# heuristic and the split-K schedule):
+#   M >= 2048: 3 pipeline stages let 64-row route blocks fit (smem 73,216),
+#              fewer + larger blocks cut the per-block weight decode count
+#              (3072: 5.18 -> 4.12 ms per launch).
+#   1024 <= M < 2048: the 64 KiB direct decode table + 2 stages at block 32
+#              (smem 92,160; 1536: 3.19 -> 2.64 ms).
+#   128 <= M < 1024: direct table + 3 stages at block 16 (smem 91,904;
+#              512: 2.41 -> 1.63 ms; the 256-512 band is the same shape the
+#              live trace's small remainder launch runs, 48 -> 16-row blocks).
+# The direct ("full") table requires the 1 CTA/SM geometry and 64 KiB of
+# shared memory beside the staging; callers fall back to the compact table
+# when the plan cannot hold it.
+def trellis_prefill_launch_shape(m: int) -> dict | None:
+    """Measured prefill launch shape for the Trellis fused kernel, or None.
+
+    None keeps the shipped heuristic plan untouched. Selected only when
+    ``B12X_W4A16_PREFILL_SHAPES=1`` is set in the environment (read at
+    compile/prepare time, like the other b12x experiment switches) and only
+    for prefill token counts (M >= 128), so decode graph catalogs are
+    bit-identical to the current package by construction.
+    """
+    if os.getenv("B12X_W4A16_PREFILL_SHAPES", "0") != "1":
+        return None
+    m = int(m)
+    if m < 128:
+        return None
+    if m >= 2560:
+        return {"block_size_m": 64, "pipeline_stages": 3, "trellis_decode_table": "compact"}
+    if m >= 2048:
+        # Measured: at 2048 rows every variant loses to the heuristic plan
+        # (stock 3,496 us; 64-row shape 3,654; direct+2 stages block 32
+        # 3,808). Leave it alone.
+        return None
+    if m >= 1024:
+        return {"block_size_m": 32, "pipeline_stages": 2, "trellis_decode_table": "full"}
+    return {"block_size_m": 16, "pipeline_stages": 3, "trellis_decode_table": "full"}
+
+
 def route_block_sizes_for_capacity(
     max_tokens: int,
     topk: int,

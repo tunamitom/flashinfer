@@ -8477,7 +8477,10 @@ def _plan_full_rotation_w4a16_launches(
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Trellis launch planning cannot run during capture")
 
-    from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
+    from b12x.moe._shared.kernels.w4a16.host import (
+        route_pack_capacity,
+        trellis_prefill_launch_shape,
+    )
     from b12x.moe._shared.kernels.w4a16.kernel.config import _DEFAULT_MAX_SHARED_MEM
     from b12x.moe._shared.kernels.w4a16.kernel.fused_launch import (
         compile_w4a16_fused_moe,
@@ -8490,6 +8493,29 @@ def _plan_full_rotation_w4a16_launches(
             "Trellis launch planning requires the arena's route_block_size_m"
         )
     block_size_m = int(core_plan.route_block_size_m)
+
+    def _launch_shape(token_count: int) -> tuple[int, int | None, tuple | None, str]:
+        """(block, stages, tile, decode-table) for one launch.
+
+        Planner knobs (MoeDecodeConfig.w4a16_*; inert before this wiring) win
+        when explicitly set, then the measured prefill shapes (R3,
+        trellis_prefill_launch_shape), then the arena heuristic plan. The block
+        itself is resolved once by _resolve_trellis_route_block_size (sizing
+        and binding share it); stages/tiles/table are compile-time only.
+        """
+        measured = trellis_prefill_launch_shape(token_count) or {}
+        block = block_size_m
+        stages = caps.decode_config.w4a16_pipeline_stages or measured.get(
+            "pipeline_stages"
+        )
+        tiles = caps.decode_config.w4a16_tile_config or core_plan.trellis_tile_config
+        # The decode table is its own control (auto/compact/full). Note that
+        # w4a16_route_mode ("packed"/"direct") selects route PACKING, not the
+        # Trellis decode table - do not map one onto the other.
+        table = measured.get("trellis_decode_table") or caps.trellis_decode_table
+        return int(block), stages, tiles, table
+
+    block_size_m, _, _, _ = _launch_shape(capacity_tokens)
     weight_layout = _normalize_w4a16_weight_layout(
         caps.w4a16_weight_layout
         or _w4a16_weight_layout_for_source(
@@ -8537,6 +8563,9 @@ def _plan_full_rotation_w4a16_launches(
         )
 
         def compile_fused(token_count: int, broadcast_suh: bool) -> object:
+            launch_block, launch_stages, launch_tiles, launch_table = _launch_shape(
+                token_count
+            )
             return compile_w4a16_fused_moe(
                 size_m=token_count,
                 hidden_size=core_plan.k,
@@ -8546,7 +8575,7 @@ def _plan_full_rotation_w4a16_launches(
                 activation=core_plan.activation,
                 apply_router_weight_on_input=caps.apply_router_weight_on_input,
                 zero_fc2_output=False,
-                moe_block_size=block_size_m,
+                moe_block_size=launch_block,
                 # Match the lazy unified path: specialize the live M while
                 # retaining the caller-owned route arena's full grid capacity.
                 max_m_blocks=capacity_m_blocks,
@@ -8563,10 +8592,11 @@ def _plan_full_rotation_w4a16_launches(
                 w13_layout=w13_layout,
                 trellis_bits=core_plan.trellis_bits,
                 trellis_codebook=core_plan.trellis_codebook or LUT_E4M3,
-                trellis_decode_table=caps.trellis_decode_table,
+                trellis_decode_table=launch_table,
                 skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
                 small_m_occupancy=caps.w4a16_small_m_occupancy,
-                force_tile_config=core_plan.trellis_tile_config,
+                force_tile_config=launch_tiles,
+                pipeline_stages=launch_stages,
                 intermediate_rotation=True,
                 full_rotation=True,
                 intermediate_hadamard=core_plan.intermediate_hadamard,
@@ -8956,6 +8986,9 @@ def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
     """Resolve the one route geometry shared by trellis sizing and binding."""
     if caps.w4a16_block_size_m is not None:
         return int(caps.w4a16_block_size_m)
+    if caps.decode_config.w4a16_block_size_m is not None:
+        # R3 wiring: the planner knob existed but never reached the launch.
+        return int(caps.decode_config.w4a16_block_size_m)
     if caps.source_format not in _TRELLIS_SOURCE_FORMATS:
         return None
     if _normalize_quant_mode(caps.quant_mode) != "w4a16":
@@ -8972,6 +9005,25 @@ def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
         bucket_w4a16_tokens=False,
     )
     route_experts = caps.route_num_experts or caps.weight_E
+    from b12x.moe._shared.kernels.w4a16.host import trellis_prefill_launch_shape
+
+    measured = (
+        trellis_prefill_launch_shape(max(token_counts))
+        if caps.weight_plan.trellis_pair_kinds is None
+        else None
+    ) or {}
+    # R3's measured prefill shape feeds the shared resolver (arena sizing AND
+    # launch binding), so the 64-row blocks at M >= 2048 are covered by the
+    # route-slot scratch, not just the launch. Like an explicit knob, the
+    # env-gated measured policy asserts its block directly: it was measured to
+    # compile and run (smem 73,216 at block 64 / 3 stages, 5.8 -> 4.3 ms at
+    # M=3072), while the heuristic's _candidate_tile_fits check rejects it
+    # (it prices the 4-stage staging) and silently falls back to 48 rows.
+    policy_block = (
+        int(measured["block_size_m"]) if measured.get("block_size_m") else None
+    )
+    if policy_block:
+        return policy_block
     preferred = select_route_block_size_m(
         max(token_counts),
         caps.num_topk,
@@ -9228,6 +9280,7 @@ def _prewarm_w4a16_planned_launches(
         prefill_fused_sum_eligible,
         route_pack_capacity,
         select_route_block_size_m,
+        trellis_prefill_launch_shape,
     )
     from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _DEFAULT_MAX_SHARED_MEM,
@@ -9277,9 +9330,22 @@ def _prewarm_w4a16_planned_launches(
         )
         for token_count in token_counts:
             t_token = time.perf_counter() if _B12X_TIMING else 0.0
+            # R3: measured prefill launch shapes (env B12X_W4A16_PREFILL_SHAPES)
+            # override the heuristic for prefill sizes only, and only for the
+            # full-rotation Trellis kernel they were measured on (no per-pair
+            # extents; other W4A16 layouts keep the heuristic). The block comes
+            # from the shared arena resolver; stages and decode table are
+            # compile-time only.
+            measured = (
+                trellis_prefill_launch_shape(token_count)
+                if full_rotation and _fc_trellis_pair_kind(workspace) is None
+                else None
+            ) or {}
             block_size_m = workspace.route_block_size_m or select_route_block_size_m(
                 token_count, workspace.num_topk, workspace.route_E
             )
+            launch_stages = measured.get("pipeline_stages")
+            launch_table = measured.get("trellis_decode_table", "auto")
             routed_rows = int(token_count) * int(workspace.num_topk)
             _, _, max_m_blocks = route_pack_capacity(
                 routed_rows,
@@ -9337,6 +9403,8 @@ def _prewarm_w4a16_planned_launches(
                     fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                     fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                     force_tile_config=workspace.trellis_tile_config,
+                    pipeline_stages=launch_stages,
+                    trellis_decode_table=launch_table,
                     intermediate_rotation=full_rotation,
                     full_rotation=full_rotation,
                     intermediate_hadamard=workspace.intermediate_hadamard,
