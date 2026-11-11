@@ -61,6 +61,23 @@ _PREPARED_KIMI_TOPK_LAUNCHERS: set[int] = set()
 # non-posted peer reads) is unchanged when this is unset or "0".
 PAIR_PUSH_ENV = "B12X_PCIE_DCP_PAIR_PUSH"
 PAIR_PUSH_MAX_ROWS = 8
+# W22 policy of the fused select that rides the push transport
+# (all_gather_pair_kimi_topk), documented at the switch per the TP9 J-D ruling:
+#   Tie policy:       equal selection scores pick the lower expert id, identical
+#                     in the standalone and the fused select.
+#   Near-tie policy:  scores within a few fp32 ULP may rank opposite in the two
+#                     implementations (different sigmoid forms, up to 4 ULP), so
+#                     the sixteenth expert can differ. Measured W22 rate (2.4M
+#                     production-shaped rows at 1/4/8 rows): 6.7e-6 boundary
+#                     swaps (every pair within 2 ULP) and 5.6e-5 same-set slot
+#                     order swaps.
+#   Non-finite:       a non-finite router logit is NEVER a candidate in the fused
+#                     select; a row with no finite candidate returns ids 0-15 at
+#                     weight exactly zero. The standalone select scores +inf as
+#                     sigmoid=1 and would select it — out of contract (real
+#                     router logits are finite).
+#   Scope:            the fused path engages at 8 rows or fewer — it helps
+#                     single-stream rounds, not packed multi-stream ones.
 
 
 def pair_push_enabled() -> bool:
