@@ -150,6 +150,7 @@ class W4A16GemmKernel:
         skip_empty_m_blocks: bool | None = None,
         small_m_occupancy: int | None = None,
         csf_inline_scales: bool = False,
+        reduction_over_stages: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -590,6 +591,17 @@ class W4A16GemmKernel:
         sh_size_max = max(sh_red_size, sh_b_size)
         sh_bias_size = self.cta_n_blocks * 16 // 8
         sh_b_red_bias_size = max(sh_size_max, sh_size_min + sh_bias_size)
+        # Opt-in prefill layout (fused table "full1", M > 16 plans only): the
+        # BF16 output / reduction tile is only live after the mainloop, when
+        # the scale and activation stages are dead too (the FP32 partial
+        # reduction already extends over them), so it may cover B + S + A
+        # instead of reserving max(red, B) before S. Frees up to
+        # red - B bytes so the 64 KiB direct table fits beside 48-row stages.
+        self.reduction_over_stages = bool(reduction_over_stages) and (
+            not self.uses_m_block_8 and not self.csf_block_inline
+        )
+        if self.reduction_over_stages:
+            sh_b_red_bias_size = sh_b_size + sh_bias_size
         self.sh_b_off = self.sh_valid_count_off
         self.sh_red_off = self.sh_valid_count_off
         self.sh_s_off = self.sh_valid_count_off + sh_b_red_bias_size
@@ -601,6 +613,8 @@ class W4A16GemmKernel:
             + _reduction_shared_bytes(self.tile_n, self.tile_k, self.uses_m_block_8)
             // 16,
         )
+        if self.reduction_over_stages:
+            self.shared_int4 = max(self.shared_int4, self.sh_red_off + sh_red_size)
         if self.csf_block_inline:
             self.csf_stage_groups = ((self.tile_n + 127) // 128) * (
                 (self.s_tb_groups + 3) // 4
@@ -688,7 +702,7 @@ class W4A16GemmKernel:
             self.trellis_direct_lut,
             self.small_m_splitk,
             self.skip_empty_m_blocks,
-        )
+        ) + (("reduction_over_stages",) if self.reduction_over_stages else ())
 
     @cute.jit
     def _activation_smem_permuted_offset(self, i: Int32) -> Int32:

@@ -8477,9 +8477,10 @@ def _plan_full_rotation_w4a16_launches(
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Trellis launch planning cannot run during capture")
 
-    from b12x.moe._shared.kernels.w4a16.host import (
-        route_pack_capacity,
+    from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
+    from b12x.moe.fused_moe._prefill_shapes import (
         trellis_prefill_launch_shape,
+        trellis_prefill_native_tile,
     )
     from b12x.moe._shared.kernels.w4a16.kernel.config import _DEFAULT_MAX_SHARED_MEM
     from b12x.moe._shared.kernels.w4a16.kernel.fused_launch import (
@@ -8494,7 +8495,9 @@ def _plan_full_rotation_w4a16_launches(
         )
     block_size_m = int(core_plan.route_block_size_m)
 
-    def _launch_shape(token_count: int) -> tuple[int, int | None, tuple | None, str]:
+    def _launch_shape(
+        token_count: int, plan_table_only: bool = False
+    ) -> tuple[int, int | None, tuple | None, str]:
         """(block, stages, tile, decode-table) for one launch.
 
         Planner knobs (MoeDecodeConfig.w4a16_*; inert before this wiring) win
@@ -8502,17 +8505,30 @@ def _plan_full_rotation_w4a16_launches(
         trellis_prefill_launch_shape), then the arena heuristic plan. The block
         itself is resolved once by _resolve_trellis_route_block_size (sizing
         and binding share it); stages/tiles/table are compile-time only.
+        ``plan_table_only`` falls back to the plan's decode table when the
+        direct (full/full1) table does not fit this geometry (opt-in retry).
         """
         measured = trellis_prefill_launch_shape(token_count) or {}
         block = block_size_m
         stages = caps.decode_config.w4a16_pipeline_stages or measured.get(
             "pipeline_stages"
         )
-        tiles = caps.decode_config.w4a16_tile_config or core_plan.trellis_tile_config
-        # The decode table is its own control (auto/compact/full). Note that
-        # w4a16_route_mode ("packed"/"direct") selects route PACKING, not the
-        # Trellis decode table - do not map one onto the other.
-        table = measured.get("trellis_decode_table") or caps.trellis_decode_table
+        # The measured policy may carry its own tile (direct-table mode:
+        # 128,128,64,256); otherwise an explicit planner knob wins, then a
+        # native-tile prefill-shape launch keeps the weight plan's tile, then
+        # the plan's tile as before.
+        tiles = measured.get("tile_config") or (
+            core_plan.trellis_tile_config
+            if trellis_prefill_native_tile(token_count)
+            else (caps.decode_config.w4a16_tile_config or core_plan.trellis_tile_config)
+        )
+        # The decode table is its own control (auto/compact/full/full1). Note
+        # that w4a16_route_mode ("packed"/"direct") selects route PACKING, not
+        # the Trellis decode table - do not map one onto the other.
+        if plan_table_only:
+            table = caps.trellis_decode_table
+        else:
+            table = measured.get("trellis_decode_table") or caps.trellis_decode_table
         return int(block), stages, tiles, table
 
     block_size_m, _, _, _ = _launch_shape(capacity_tokens)
@@ -8563,8 +8579,24 @@ def _plan_full_rotation_w4a16_launches(
         )
 
         def compile_fused(token_count: int, broadcast_suh: bool) -> object:
+            measured_table = (trellis_prefill_launch_shape(token_count) or {}).get(
+                "trellis_decode_table"
+            )
+            try:
+                return _compile_fused(token_count, broadcast_suh)
+            except ValueError as exc:
+                # The direct ("full"/"full1") table needs 1 CTA/SM and 64 KiB of
+                # shared memory beside the staging; fall back to the plan's table
+                # when this geometry cannot hold it (prefill-shape launches only).
+                if measured_table not in ("full", "full1") or "decode table" not in str(exc):
+                    raise
+                return _compile_fused(token_count, broadcast_suh, plan_table_only=True)
+
+        def _compile_fused(
+            token_count: int, broadcast_suh: bool, plan_table_only: bool = False
+        ) -> object:
             launch_block, launch_stages, launch_tiles, launch_table = _launch_shape(
-                token_count
+                token_count, plan_table_only=plan_table_only
             )
             return compile_w4a16_fused_moe(
                 size_m=token_count,
@@ -9005,7 +9037,7 @@ def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
         bucket_w4a16_tokens=False,
     )
     route_experts = caps.route_num_experts or caps.weight_E
-    from b12x.moe._shared.kernels.w4a16.host import trellis_prefill_launch_shape
+    from b12x.moe.fused_moe._prefill_shapes import trellis_prefill_launch_shape
 
     measured = (
         trellis_prefill_launch_shape(max(token_counts))
@@ -9280,8 +9312,8 @@ def _prewarm_w4a16_planned_launches(
         prefill_fused_sum_eligible,
         route_pack_capacity,
         select_route_block_size_m,
-        trellis_prefill_launch_shape,
     )
+    from b12x.moe.fused_moe._prefill_shapes import trellis_prefill_launch_shape
     from b12x.moe._shared.kernels.w4a16.kernel.config import (
         _DEFAULT_MAX_SHARED_MEM,
         _MAX_DIRECT_TOPK_ROUTE_M,
@@ -9402,7 +9434,9 @@ def _prewarm_w4a16_planned_launches(
                     trellis_codebook=workspace.trellis_codebook or LUT_E4M3,
                     fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                     fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
-                    force_tile_config=workspace.trellis_tile_config,
+                    force_tile_config=(
+                        measured.get("tile_config") or workspace.trellis_tile_config
+                    ),
                     pipeline_stages=launch_stages,
                     trellis_decode_table=launch_table,
                     intermediate_rotation=full_rotation,
