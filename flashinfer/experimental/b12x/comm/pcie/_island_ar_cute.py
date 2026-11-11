@@ -38,7 +38,6 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
-from b12x._lib.compile_plan import attach_programs
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import (
     cuda_stream_from_int_or_current,
@@ -46,6 +45,7 @@ from b12x._lib.utils.device import (
     current_cuda_stream,
 )
 from b12x._lib.utils.pointers import make_ptr
+
 
 @dsl_user_op
 def _atomic_add_global_u32(
@@ -67,6 +67,7 @@ def _atomic_add_global_u32(
             ip=ip,
         )
     )
+
 
 @dsl_user_op
 def _load_acquire_sys_u32(address: Int64, *, loc=None, ip=None) -> Uint32:
@@ -117,6 +118,7 @@ def _fence_sc_sys(*, loc=None, ip=None) -> None:
         ip=ip,
     )
 
+
 @dsl_user_op
 def _nanosleep(cycles: Uint32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
@@ -139,6 +141,7 @@ def _wait_for(address: Int64, generation: Uint32, cycles: int) -> None:
         if cutlass.const_expr(cycles > 0):
             _nanosleep(Uint32(cycles))
         observed = _load_acquire_sys_u32(address)
+
 
 @cute.jit
 def _flag_address(base: Int64, region: int, block: Int32, index: Int32) -> Int64:
@@ -363,7 +366,7 @@ class _IslandARLaunch:
 
         # Phase 1 -- publish my whole input locally, then reduce my quarter by
         # pulling it out of the four island stages. The FP32 lane-order sum and
-        # the single BF16 pack are the L1 wire's one extra rounding.
+        # the single BF16 pack are the composed wire's one extra rounding.
         self_stage = cute.recast_ptr(
             cute.make_ptr(
                 cutlass.BFloat16,
@@ -662,5 +665,6 @@ def get_island_ar_launcher(
         )
 
     return attach_programs(run, raw)
+
 
 __all__ = ["HEADER_BYTES", "MAX_BLOCKS", "get_island_ar_launcher", "island_ar_peers"]

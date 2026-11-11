@@ -1,9 +1,9 @@
-"""TP8 two-island all-reduce on GPU: bit-exact vs the CPU emulation of record.
+"""TP8 two-island all-reduce on GPU: bit-exact vs the pinned CPU reference.
 
-The kernel's HARD contract: kernel output must equal the composed-wire
-emulation bit-for-bit on the recorded prefill shapes. Also exercises eager
-launches, graph capture/replay stability and multi-generation double
-buffering, mirroring test_pcie_island_rs_gpu.py.
+The kernel's strict contract: kernel output must equal the composed-wire
+emulation bit-for-bit on the recorded prefill shapes and on the small/odd
+shapes below. Also exercises eager launches, graph capture/replay stability
+and multi-generation double buffering, mirroring test_pcie_island_rs_gpu.py.
 
 Run (8 GPUs behind two switches):
 
@@ -39,7 +39,24 @@ pytestmark = pytest.mark.skipif(
 
 WORLD_SIZE = 8
 MAX_ROWS = 3072
-SHAPES = ((3072, 7168), (3072, 3584))
+# (rows, cols) coverage: the prefill shapes plus small and odd element counts
+# so every _pick_blocks value (8/16/32 blocks) runs, and each small/odd shape
+# has pairs = numel/2 with pairs % 4 != 0, which drives the uneven-quarter
+# path (a quarter boundary not divisible into equal parts).
+#   (3072, 7168)    22_020_096 elems -> 32 blocks, pairs % 4 == 0
+#   (3072, 3584)    11_010_048 elems -> 32 blocks, pairs % 4 == 0
+#   (1, 2)                  2 elems ->  8 blocks, pairs = 1
+#   (1, 4098)            4_098 elems -> 16 blocks, pairs = 2_049
+#   (3, 4098)           12_294 elems -> 16 blocks, pairs = 6_147 (odd rows)
+#   (1, 1_048_578)   1_048_578 elems -> 32 blocks, pairs = 524_289
+SHAPES = (
+    (3072, 7168),
+    (3072, 3584),
+    (1, 2),
+    (1, 4098),
+    (3, 4098),
+    (1, 1_048_578),
+)
 GRAPH_ROUNDS = 10
 
 
@@ -51,15 +68,16 @@ def _free_port() -> int:
 
 def _prepare(session, runtime, inp, out, name):
     query = _owner_preparation.query_from_runtime(
-        runtime, surface="PCIeIslandARAllReduce.all_reduce",
-        call=dict(inp=inp, out=out))
+        runtime, surface="PCIeIslandARAllReduce.all_reduce", call=dict(inp=inp, out=out)
+    )
     plan = _owner_preparation.plan(query, runtime=runtime)
     session.prepare(
         (
             plan.request(
                 name=name,
                 prepare_call=lambda state: _owner_preparation.prepared_call(
-                    state, inp=inp, out=out),
+                    state, inp=inp, out=out
+                ),
                 collective=_owner_preparation.collective(runtime, key=name),
             ),
         ),
@@ -74,7 +92,7 @@ def _assert_bits(actual: torch.Tensor, expected: torch.Tensor, what: str) -> Non
     assert actual.dtype == torch.bfloat16
     assert torch.equal(
         actual.view(torch.uint16).cpu(), expected.view(torch.uint16).cpu()
-    ), f"{what}: kernel output is not bit-exact vs the CPU emulation of record"
+    ), f"{what}: kernel output is not bit-exact vs the pinned CPU reference"
 
 
 def _worker(rank: int, world: int, port: int) -> None:
@@ -104,8 +122,8 @@ def _worker(rank: int, world: int, port: int) -> None:
         from b12x.preparation import PreparationSession
 
         session = PreparationSession(
-            device=device, autotune=False, compile_workers=1,
-            collective_barrier=barrier)
+            device=device, autotune=False, compile_workers=1, collective_barrier=barrier
+        )
 
         graph_inp = None
         for rows, cols in SHAPES:
@@ -114,8 +132,9 @@ def _worker(rank: int, world: int, port: int) -> None:
                 expected = island_composed_all_reduce(xs)
                 inp = xs[rank].to(device)
                 out = torch.empty_like(inp)
-                plan = _prepare(session, runtime, inp, out,
-                                f"hidden.reduce{rows}x{cols}{cls}")
+                plan = _prepare(
+                    session, runtime, inp, out, f"hidden.reduce{rows}x{cols}{cls}"
+                )
                 result = runtime.all_reduce(inp, plan=plan, out=out)
                 assert result is out
                 torch.cuda.synchronize(device)

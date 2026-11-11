@@ -41,6 +41,7 @@ _ALIGNMENT = 256
 def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     return (int(value) + alignment - 1) // alignment * alignment
 
+
 def _threads_from_env() -> int:
     # Default CUDA thread count for the TP8 two-island launch.
     raw = os.getenv("B12X_PCIE_ISLAND_AR_THREADS", "512")
@@ -50,6 +51,7 @@ def _threads_from_env() -> int:
             "B12X_PCIE_ISLAND_AR_THREADS must be a multiple of 32 in [32, 1024]"
         )
     return threads
+
 
 def _wait_nanosleep_cycles_from_env() -> int:
     cycles = int(os.getenv("B12X_PCIE_ISLAND_AR_NANOSLEEP_CYCLES", "24"))
@@ -68,7 +70,7 @@ def _pick_blocks(elements: int) -> int:
 
 
 def composed_wire_reference(inputs: Sequence[torch.Tensor]) -> torch.Tensor:
-    """Bit-exact CPU emulation of the composed TP8 two-island wire (L1).
+    """Bit-exact CPU emulation of the composed TP8 two-island wire.
 
     Stage arithmetic exactly as the kernel in ``_island_ar_cute`` runs it, per
     element (the arithmetic is elementwise, so the launch's pack partitioning
@@ -105,10 +107,10 @@ class PCIeIslandARAllReduce:
 
     Every rank owns one quarter of the vector and reaches four peers: the three
     other lanes of its four-GPU switch island, and the same lane across the
-    B<->D uplink. Peer degree is bounded at four, and no rank carries the whole
-    vector on behalf of the others. Cross-uplink bytes per launch fall to one
-    quarter of the two-shot pull's per-rank traffic (the speedup premise:
-    4x less cross-uplink arithmetic).
+    inter-island uplink. Peer degree is bounded at four, and no rank carries the
+    whole vector on behalf of the others. Cross-uplink bytes per launch fall to
+    one quarter of the two-shot pull's per-rank traffic (the expected speedup
+    comes from 4x less cross-uplink arithmetic per launch).
     """
 
     def __init__(
@@ -128,9 +130,7 @@ class PCIeIslandARAllReduce:
         self.world_size = dist.get_world_size(group=exchange_group)
         self.device = _normalize_device(device)
         if self.world_size not in SUPPORTED_WORLD_SIZES:
-            raise ValueError(
-                f"island all-reduce requires TP8, got TP{self.world_size}"
-            )
+            raise ValueError(f"island all-reduce requires TP8, got TP{self.world_size}")
         if self.device.type != "cuda":
             raise ValueError("island all-reduce requires a CUDA device")
         if blocks is not None and blocks not in SUPPORTED_BLOCKS:
@@ -212,7 +212,7 @@ class PCIeIslandARAllReduce:
         """Own the BF16 island channel for reductions of up to max_rows rows.
 
         Capacities match ``PCIeTwoShotBF16.from_exchange_group`` so the island
-        channel is a drop-in for the exact-twin factory's envelope.
+        channel is a drop-in replacement with the same capacity envelope.
         """
         return cls(
             exchange_group=exchange_group,
@@ -357,6 +357,7 @@ class PCIeIslandARAllReduce:
             self._ipc.cudaFree(self._local_ptr)
             self._local_ptr = 0
         dist.barrier(group=self.group)
+
 
 __all__ = [
     "PCIeIslandARAllReduce",
