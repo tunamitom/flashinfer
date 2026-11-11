@@ -38,6 +38,7 @@ SURFACES = {
     "VocabParallelArgmax.fused_add_argmax": (8, 12, 16),
     "PCIeHierarchicalAllReduce.all_reduce": (9, 10, 12, 16),
     "PCIeIslandRSAllReduce.all_reduce": (16,),
+    "PCIeIslandARAllReduce.all_reduce": (8,),
     "kimi_topk16": (1,),
 }
 

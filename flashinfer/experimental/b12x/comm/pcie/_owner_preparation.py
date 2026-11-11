@@ -25,6 +25,14 @@ from ._tuning import PcieConfig, PcieQuery, TUNING
 
 _COMPONENT = "comm.pcie"
 
+# Equal-quarter island all-reduce surfaces: TP16 four-island reduce-scatter
+# (island_rs) and L1's TP8 two-island all-reduce (island_ar). Both expose the
+# same owner metadata: runtime module -> surface, via _surface_for_runtime.
+_ISLAND_SURFACES = {
+    "PCIeIslandRSAllReduce.all_reduce": "pcie_island_rs",
+    "PCIeIslandARAllReduce.all_reduce": "pcie_island_ar",
+}
+
 
 def _runtime_device(runtime):
     device = getattr(runtime, "device", None)
@@ -63,6 +71,7 @@ def _surface_for_runtime(runtime) -> str:
         "PCIeVocabParallelArgmax": "VocabParallelArgmax.fused_add_argmax",
         "PCIeHierarchicalAllReduce": "PCIeHierarchicalAllReduce.all_reduce",
         "PCIeIslandRSAllReduce": "PCIeIslandRSAllReduce.all_reduce",
+        "PCIeIslandARAllReduce": "PCIeIslandARAllReduce.all_reduce",
     }.get(name, "")
 
 
@@ -158,17 +167,20 @@ def query_from_runtime(
             "slab_bytes": _runtime_slab_bytes(runtime),
             "peer_ranks": tuple(_selected_peers(runtime)),
         }
-    elif surface == "PCIeIslandRSAllReduce.all_reduce":
-        inp, out = raw["inp"], raw.get("out")
-        from .pcie_island_rs import _pick_blocks
+    elif surface in _ISLAND_SURFACES:
+        from importlib import import_module
 
+        inp, out = raw["inp"], raw.get("out")
+        pick_blocks = import_module(
+            f"{__package__}.{_ISLAND_SURFACES[surface]}"
+        )._pick_blocks
         blocks = (
             int(raw["blocks"])
             if raw.get("blocks") is not None
             else (
                 runtime.blocks
                 if runtime.blocks is not None
-                else _pick_blocks(inp.numel())
+                else pick_blocks(inp.numel())
             )
         )
         controls = {
@@ -251,6 +263,16 @@ def compile_owner_surface(query_payload, ordinal):
             from ._island_rs_cute import get_island_rs_launcher
 
             return get_island_rs_launcher(
+                query.world_size,
+                query.rank,
+                ordinal,
+                threads=call["threads"],
+                wait_nanosleep_cycles=call["wait_nanosleep_cycles"],
+            )
+        if query.surface == "PCIeIslandARAllReduce.all_reduce":
+            from ._island_ar_cute import get_island_ar_launcher
+
+            return get_island_ar_launcher(
                 query.world_size,
                 query.rank,
                 ordinal,
@@ -401,7 +423,7 @@ def prepared_call(state, **actual):
             output=out,
             capture_safe=True,
         )
-    if query.surface == "PCIeIslandRSAllReduce.all_reduce":
+    if query.surface in _ISLAND_SURFACES:
         out = actual.get("out")
         if out is None:
             import torch

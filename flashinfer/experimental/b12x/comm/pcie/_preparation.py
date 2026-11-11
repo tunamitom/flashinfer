@@ -17,6 +17,7 @@ _OWNER_SURFACES = frozenset(
         "VocabParallelArgmax.fused_add_argmax",
         "PCIeHierarchicalAllReduce.all_reduce",
         "PCIeIslandRSAllReduce.all_reduce",
+        "PCIeIslandARAllReduce.all_reduce",
     )
 )
 
