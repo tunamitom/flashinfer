@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from b12x._lib.quant.block_codec import BLOCK_CODECS
 from b12x._lib.quant.block_codec import IQ2_CODECS
 from cutlass.cutlass_dsl import Int32
