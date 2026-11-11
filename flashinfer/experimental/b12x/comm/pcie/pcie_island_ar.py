@@ -1,7 +1,7 @@
-"""Pull-based TP8 two-island all-reduce runtime (L1, REVIEW-J6).
+"""Pull-based TP8 two-island all-reduce runtime.
 
-World 8 splits into two four-GPU switch islands: ranks 0-3 = island B and
-ranks 4-7 = island D (gpu-select.py order). This is ``pcie_island_rs.py``
+World 8 splits into two four-GPU switch islands: ranks 0-3 and ranks 4-7,
+one switch island each. This is ``pcie_island_rs.py``
 generalized to ``ISLAND_SIZE = 4`` / 2 islands / world 8: equal-quarter BF16
 ownership, four mapped peers per rank (three island lanes plus the same lane
 across the uplink), and the composed wire's one extra BF16 rounding of a
@@ -82,7 +82,7 @@ def composed_wire_reference(inputs: Sequence[torch.Tensor]) -> torch.Tensor:
       Phase 3 (island all-gather): exact BF16 copies.
 
     Torch's CPU BF16 conversion is RTNE and bit-identical to
-    ``__float2bfloat16`` (verified in L1-V1-NUMERIC's diagnostics).
+    ``__float2bfloat16``.
     """
     if len(inputs) != SUPPORTED_WORLD_SIZES[0]:
         raise ValueError(f"composed wire reference expects 8 inputs, got {len(inputs)}")
@@ -107,8 +107,8 @@ class PCIeIslandARAllReduce:
     other lanes of its four-GPU switch island, and the same lane across the
     B<->D uplink. Peer degree is bounded at four, and no rank carries the whole
     vector on behalf of the others. Cross-uplink bytes per launch fall to one
-    quarter of the two-shot pull's per-rank traffic (the L1 speedup premise,
-    L1-V0-BOTTLENECK's 4x arithmetic).
+    quarter of the two-shot pull's per-rank traffic (the speedup premise:
+    4x less cross-uplink arithmetic).
     """
 
     def __init__(
