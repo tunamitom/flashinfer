@@ -732,17 +732,25 @@ def test_kimi_topk16_dispatches_compact_outputs(world_size: int, rows: int) -> N
     runtime.close()
 
 
-@pytest.mark.parametrize("rows", (0, 9))
+@pytest.mark.parametrize("rows", (0, 21))
 def test_kimi_topk16_rejects_out_of_range_rows(rows: int) -> None:
-    runtime = _make_kimi_runtime(2)
     router_logits = torch.zeros((rows, 896), dtype=torch.float32)
     correction_bias = torch.zeros(896, dtype=torch.float32)
 
-    try:
-        with pytest.raises(ValueError, match="must be between 1"):
-            runtime.kimi_topk16(router_logits, correction_bias)
-    finally:
-        runtime.close()
+    with pytest.raises(ValueError, match="must be between 1"):
+        kimi_topk16(router_logits, correction_bias, plan=None)
+
+
+@pytest.mark.parametrize("rows", (1, 8, 9, 16, 20))
+def test_kimi_topk16_accepts_rows_up_to_the_cap(rows: int) -> None:
+    # The row cap is validated before any plan or device use, so the accepted
+    # range is observable on CPU: rows within the cap fall through to the CUDA
+    # tensor requirement.
+    router_logits = torch.zeros((rows, 896), dtype=torch.float32)
+    correction_bias = torch.zeros(896, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="requires CUDA"):
+        kimi_topk16(router_logits, correction_bias, plan=None)
 
 
 def test_kimi_topk16_capture_requires_caller_owned_outputs(
