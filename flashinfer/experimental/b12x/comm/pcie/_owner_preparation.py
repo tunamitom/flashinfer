@@ -26,7 +26,7 @@ from ._tuning import PcieConfig, PcieQuery, TUNING
 _COMPONENT = "comm.pcie"
 
 # Equal-quarter island all-reduce surfaces: TP16 four-island reduce-scatter
-# (island_rs) and L1's TP8 two-island all-reduce (island_ar). Both expose the
+# (island_rs) and the TP8 two-island all-reduce (island_ar). Both expose the
 # same owner metadata: runtime module -> surface, via _surface_for_runtime.
 _ISLAND_SURFACES = {
     "PCIeIslandRSAllReduce.all_reduce": "pcie_island_rs",
