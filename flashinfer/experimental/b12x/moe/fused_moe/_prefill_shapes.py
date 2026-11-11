@@ -50,7 +50,7 @@ def trellis_prefill_native_tile(m: int) -> bool:
 
 
 
-# Direct-table prefill geometry (B12X_W4A16_PREFILL_TABLE=1, default OFF).
+# Direct-table prefill geometry (B12X_W4A16_PREFILL_TABLE=1|2, default OFF).
 # Consulted only for launch token counts M > 16 (it returns None below 1536),
 # so decode / verify / draft plans never see it. Takes precedence over the
 # prefill-shapes policy where it applies; meant to be used together with
@@ -63,15 +63,31 @@ def trellis_prefill_native_tile(m: int) -> bool:
 #       (2560: 3872 vs 4183; 2048: 3045 vs 3752; 1536: 2742 vs 2880). Same
 #       numerics class as that tile (2048: bit-identical to the shapes
 #       policy in 99.99 % of outputs).
-#   Other M: None (the prefill-shapes policy decides).
+#   =2, additionally M >= 2560: 64-row blocks, 3 stages, 128-thread tile
+#       64,128,64,128 (3072: 4414 vs 4833; 2560: 3953 vs 4339). That tile
+#       changes only the fp32 summation order: it differs from the
+#       128,128,64,256 tile in ~8.6 % of outputs, by <= 1 bf16 ulp of the row
+#       max. Against an fp64 reference of the expert layer built from the same
+#       decoded weights (M=3072/2560, gaussian and outlier-channel inputs) its
+#       relative RMS error equals that tile's to 4 digits (3072: 1.7612e-3
+#       both; bf16 rounding floor 1.658e-3), max error <= 0.67 ulp of the row
+#       max for both.
+#   M < 1536, or =1 and M > 2560: None (the prefill-shapes policy decides).
 def trellis_prefill_table_shape(m: int) -> dict | None:
     """Direct-table prefill launch shape (block, stages, table, tile), or None."""
     mode = os.getenv("B12X_W4A16_PREFILL_TABLE", "0")
-    if mode != "1":
+    if mode not in ("1", "2"):
         return None
     m = int(m)
     if m <= 16:
         return None
+    if mode == "2" and m >= 2560:
+        return {
+            "block_size_m": 64,
+            "pipeline_stages": 3,
+            "trellis_decode_table": "full1",
+            "tile_config": (64, 128, 64, 128),
+        }
     if 1536 <= m <= 2560:
         return {
             "block_size_m": 48,
