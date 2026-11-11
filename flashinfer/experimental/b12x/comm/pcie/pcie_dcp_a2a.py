@@ -54,10 +54,12 @@ _SIGNAL_BYTES = (
 
 PAIR_PUSH_MAX_ROWS = 8  # fused Kimi top-16 rows (one CTA per row)
 # The standalone Kimi top-16 runs one CTA per row (grid = rows) and selects
-# every row independently, so 9..16 rows (for example two concurrent
+# every row independently, so 9..20 rows (for example two concurrent
 # speculative streams) produce the same bytes per row as 1..8 rows. Callers
-# that never pass more than eight rows are unaffected.
-KIMI_TOPK16_MAX_ROWS = 16
+# that never pass more than eight rows are unaffected. The row cap is only a
+# Python check; the kernel accepts any row count the grid can carry (W23-A
+# extension: 17..20 rows price the widest four-stream verify shape).
+KIMI_TOPK16_MAX_ROWS = 20
 PAIR_PUSH_MAX_BLOCKS = 64  # per-CTA barrier records (_dcp_a2a_cute._MAX_BLOCKS)
 
 
@@ -118,7 +120,7 @@ def kimi_topk16(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select Kimi-K3's 16 routed experts with prepared native code.
 
-    The operation accepts one to sixteen assembled FP32 router rows. It launches
+    The operation accepts one to twenty assembled FP32 router rows. It launches
     on the current CUDA stream and is CUDA-graph safe with caller-owned outputs.
     """
 
