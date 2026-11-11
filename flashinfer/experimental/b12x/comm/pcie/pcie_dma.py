@@ -40,6 +40,29 @@ MAX_PIECES = 8
 SCRATCH_ALIGN = 256
 FP8_QUANT_BLOCK = 128
 
+# Per-shape ring pieces for prefill reductions at world 8, measured on an
+# 8-GPU two-switch PCIe box (every shape in prefill_capacities(3072) x
+# {3584, 7168} cols, pieces 1/2/4/8, median of 5x20 launches). The ring's
+# time is stepped and pieces matter per shape:
+# pieces 1 wins everywhere except the two largest 7168-col reductions
+# (2560x7168: 1.207 ms at 2 vs 1.367 at 1; 3072x7168: 1.436 vs 1.637). At the
+# 3584-col shapes 1 piece is 25-48% faster than 2 (3072x3584: 0.891 vs 1.185;
+# 2048x3584: 0.645 vs 1.187). The dig's "0.88 ms at 8 pieces" for
+# (3072x3584) was this same 1-piece path: the 512 KiB minimum piece size makes
+# the old constant-2 (and any deep override) fall back to 1 there. pieces=1
+# also halves graph-node cost (128 KiB vs 224 KiB per launch, K=64 capture).
+# See _pick_pieces for the selection rules and the override semantics.
+SHAPE_PIECES: dict[tuple[int, int], int] = {
+    (128, 3584): 1, (128, 7168): 1,
+    (256, 3584): 1, (256, 7168): 1,
+    (512, 3584): 1, (512, 7168): 1,
+    (1024, 3584): 1, (1024, 7168): 1,
+    (1536, 3584): 1, (1536, 7168): 1,
+    (2048, 3584): 1, (2048, 7168): 1,
+    (2560, 3584): 1, (2560, 7168): 2,
+    (3072, 3584): 1, (3072, 7168): 2,
+}
+
 
 def _eager_replay_capacities(
     max_bytes: int,
@@ -286,15 +309,36 @@ class PCIeDmaAllReduce:
     def _scratch_ptr(self, rank: int, step: int) -> int:
         return self._scratch_base[rank] + step * self.shard_capacity
 
-    def _pick_pieces(self, shard_elems: int, shard_bytes: int) -> int:
+    def _pick_pieces(
+        self, shard_elems: int, shard_bytes: int, shape: tuple[int, ...] | None = None
+    ) -> int:
         override = self._pieces_override
-        # pieces=2 measured best at every size (deeper chunking pays an
-        # extra wait+add launch chain per piece on the main stream).
-        candidates = (override,) if 1 <= override <= MAX_PIECES else (2,)
-        for pieces in candidates:
-            if shard_elems % (pieces * 8) == 0 and shard_bytes // pieces >= 512 << 10:
+
+        def usable(pieces: int) -> bool:
+            return (
+                shard_elems % (pieces * 8) == 0
+                and shard_bytes // pieces >= 512 << 10
+            )
+
+        if 1 <= override <= MAX_PIECES and usable(override):
+            return override
+        # Per-shape ring pieces, measured on an 8-GPU two-switch PCIe box at
+        # TP8: the ring's time is stepped in shard size and the
+        # best piece count differs per reduction shape -- 8 pieces wins at
+        # (3072x3584) while (3072x7168) is fastest at 2, and pieces 8 at
+        # (3072x7168) costs 4.53 ms against 1.44 at 2. The table is keyed by
+        # the reduction shape (rows, cols) at world 8, the only shape family
+        # measured; anything else keeps the previous constant-2 behaviour.
+        # B12X_PCIE_DMA_PIECES remains a hard override (all sizes) and must
+        # never be left set: it silently wrecks prefill.
+        if shape is not None and len(shape) == 2 and self.world_size == 8:
+            pieces = SHAPE_PIECES.get((int(shape[0]), int(shape[1])))
+            if pieces is not None and usable(pieces):
                 return pieces
-        return 1
+        # pieces=2 measured best at every size before per-shape selection
+        # (deeper chunking pays an extra wait+add launch chain per piece on
+        # the main stream).
+        return 2 if usable(2) else 1
 
     def should_allreduce(self, inp: torch.Tensor) -> bool:
         if self._closed or inp.device != self.device:
@@ -499,7 +543,7 @@ class PCIeDmaAllReduce:
         # sub-chunk c+1's copy overlaps sub-chunk c's wait+reduce. Deeper
         # chunking amortizes the flag round trip further as long as each
         # piece's copy time dominates the ~5us sub-step overhead.
-        pieces = self._pick_pieces(shard_elems, shard_bytes)
+        pieces = self._pick_pieces(shard_elems, shard_bytes, shape=tuple(inp.shape))
         if compressed_ag and (shard_elems // pieces) % FP8_QUANT_BLOCK != 0:
             pieces = 1
         piece_elems = shard_elems // pieces
