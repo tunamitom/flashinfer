@@ -1,12 +1,12 @@
-"""CuTeDSL pull-based TP8 two-island all-reduce (L1, REVIEW-J6).
+"""CuTeDSL pull-based TP8 two-island all-reduce.
 
 Rank ``island * 4 + lane`` owns one equal quarter of the vector on an eight-rank
-group split into two four-GPU switch islands (ranks 0-3 island B, 4-7 island D
-from gpu-select.py). This is ``_island_rs_cute.py`` generalized to
+group split into two four-GPU switch islands (ranks 0-3 | 4-7, one switch
+island each). This is ``_island_rs_cute.py`` generalized to
 ``ISLAND_SIZE = 4``, two islands, world 8: every rank pulls from four peers, the
 three other lanes of its island and the same lane across the uplink.
 
-The composed wire (the L1 contract's one extra BF16 rounding of a 4-way FP32
+The composed wire (one extra BF16 rounding of a 4-way FP32
 partial sum) is exactly, per element:
 
   Phase 1 -- intra-island FP32 reduce-scatter in lane order, one BF16 pack
@@ -203,8 +203,8 @@ def pack_f32x2_to_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint
     )
 
 
-# L1 (REVIEW-J6): the TP8 2x4-island wire. _island_rs_cute's TP16 layout with
-# two islands instead of four; every region keeps four flag slots per block.
+# The TP8 2x4-island wire: _island_rs_cute's TP16 layout with two islands
+# instead of four; every region keeps four flag slots per block.
 _ISLAND_SIZE = 4
 _MAX_ISLANDS = 2
 _MAX_WORLD_SIZE = _ISLAND_SIZE * _MAX_ISLANDS
