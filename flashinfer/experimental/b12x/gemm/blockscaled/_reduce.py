@@ -14,13 +14,9 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 
 
 class WeightOnlySplitKReduce:
-    def __init__(self, n: int, slices: int, pdl: bool = False):
+    def __init__(self, n: int, slices: int):
         self.n = n
         self.slices = slices
-        # pdl: launched as a programmatic dependent of its split GEMM, which
-        # releases it once every GEMM CTA has started; it waits for the GEMM's
-        # completion (griddepcontrol.wait) before the first partial read.
-        self.pdl = pdl
 
     @cute.jit
     def __call__(
@@ -34,13 +30,10 @@ class WeightOnlySplitKReduce:
             grid=((Int64(m) * self.n + 255) // 256, 1, 1),
             block=(256, 1, 1),
             stream=stream,
-            use_pdl=self.pdl,
         )
 
     @cute.kernel
     def kernel(self, partials: cute.Pointer, output: cute.Pointer, m: Int32):
-        if cutlass.const_expr(self.pdl):
-            cute.arch.griddepcontrol_wait()
         offset = Int64(cute.arch.block_idx()[0]) * 256 + cute.arch.thread_idx()[0]
         size = Int64(m) * self.n
         if offset < size:
@@ -51,13 +44,13 @@ class WeightOnlySplitKReduce:
 
 
 @program_cache
-def compile_reduce(n: int, slices: int, device: int, pdl: bool = False):
+def compile_reduce(n: int, slices: int, device: int):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "A16 split-K reduction must be prewarmed before CUDA graph capture"
         )
-    launch = WeightOnlySplitKReduce(n, slices, pdl)
-    key = (n, slices, "pdl") if pdl else (n, slices)
+    launch = WeightOnlySplitKReduce(n, slices)
+    key = (n, slices)
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     return b12x_compile(
         launch,

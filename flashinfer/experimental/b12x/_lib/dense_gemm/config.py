@@ -211,9 +211,6 @@ class _DenseGemmPolicy:
     split_k_atomic_bf16: bool
     large_m_unroll: bool
     preserve_raster: bool = False
-    # A16 weight-only split-K: release the PDL-launched reduce kernel as soon as
-    # every GEMM CTA has started (the reducer still waits for grid completion).
-    split_k_pdl_reduce: bool = False
 
 
 def _max_active_clusters_for(

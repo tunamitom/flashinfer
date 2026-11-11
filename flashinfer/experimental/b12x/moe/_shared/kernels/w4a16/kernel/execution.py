@@ -1159,47 +1159,12 @@ def run_w4a16_moe(
                     "block_expert_ids is smaller than the selected W4A16 launch capacity"
                 )
             block_expert_ids = block_expert_ids[:route_blocks_capacity]
-    # B12X_TRELLIS_INKERNEL_ROUTE_PACK: a prepared kernel compiled with
-    # in-kernel route packing builds the packed layout itself for <= 128 live
-    # routes; the two Triton route-pack launches are skipped. Every other call
-    # (int64 ids, expert maps, unprepared buffers, larger M) keeps them.
-    inkernel_route_ids = None
-    if (
-        not use_direct_topk_routes
-        and fused_launch is not None
-        and bool(getattr(fused_launch, "inkernel_route_pack", False))
-        and route_pack_launches is not None
-        and expert_map is None
-        and not collect_activation_amax
-        and topk_ids.dtype == torch.int32
-        and topk_ids.is_contiguous()
-        and 0
-        < int(m) * int(topk)
-        <= int(getattr(fused_launch, "route_pack_max_routes", 128))
-        and (
-            int(getattr(fused_launch, "route_pack_max_routes", 128)) <= 128
-            or int(route_num_experts) <= 1024
-        )
-        and int(route_pack_launches.block_size) == int(block_size_m)
-        and packed_route_indices is not None
-        and block_expert_ids is not None
-        and packed_route_count is not None
-        and int(packed_route_indices.numel()) >= route_pack_launches.max_packed_routes
-        and int(block_expert_ids.numel()) >= route_pack_launches.max_route_blocks
-    ):
-        inkernel_route_ids = topk_ids.view(-1)
     if use_direct_topk_routes:
         packed_route_indices = topk_ids.view(-1)
         if block_expert_ids is None:
             block_expert_ids = packed_route_indices
         if packed_route_count is None:
             packed_route_count = packed_route_indices
-    elif inkernel_route_ids is not None:
-        packed_route_indices = packed_route_indices[: route_pack_launches.max_packed_routes]
-        block_expert_ids = block_expert_ids[: route_pack_launches.max_route_blocks]
-        packed_route_count = packed_route_count[:1]
-        route_slots_for_scratch = int(packed_route_indices.numel())
-        required_m_blocks = int(block_expert_ids.numel())
     else:
         if (
             fused_launch is not None
@@ -1716,11 +1681,8 @@ def run_w4a16_moe(
             suh_gate_table=suh_gate_table,
             suh_up_table=suh_up_table,
             launcher=fused,
-            route_ids=inkernel_route_ids,
         )
     else:
-        if inkernel_route_ids is not None:
-            raise RuntimeError("in-kernel route packing requires the native launch path")
         torch.ops.b12x.w4a16_fused_moe_launch(
             *launch_common,
             *launch_tail,

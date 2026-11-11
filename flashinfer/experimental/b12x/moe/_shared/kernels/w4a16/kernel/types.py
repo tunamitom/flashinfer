@@ -55,25 +55,6 @@ class W4A16TopKSumCompileResult:
     output_dtype: torch.dtype | None = None
 
 
-# B12X_TRELLIS_FLOW_FLAGS: kernel_workspace extension after the 4*sms+2
-# barrier/lock words: [4 reserved, fc1_ctr[MAX_BLOCKS], act_ctr[MAX_BLOCKS],
-# spare], leaving the last two words for the small-M direct barrier.  The
-# kernel zeroes it at entry (no state carried between launches).
-W4A16_FLOW_MAX_BLOCKS = 256
-# The counters replace the barriers only up to this many route blocks: with
-# more blocks (M >= 12 over the full expert set) every warp owns several
-# activation units and waiting per unit convoys behind slow blocks
-# (+1..+3.5 us measured), so larger launches keep the barriers at run time.
-W4A16_FLOW_LIVE_BLOCKS = 64
-W4A16_FLOW_WORKSPACE_EXTRA = 4 + 4 * W4A16_FLOW_MAX_BLOCKS + 4
-
-
-def w4a16_flow_flags_requested() -> bool:
-    import os
-
-    return os.environ.get("B12X_TRELLIS_FLOW_FLAGS", "0") == "1"
-
-
 @dataclass(frozen=True)
 class W4A16FusedMoeCompileResult:
     compiled: object
@@ -121,11 +102,6 @@ class W4A16FusedMoeCompileResult:
     broadcast_suh: bool = False
     small_m_direct_launches: tuple[_W4A16SmallMDirectLaunch, ...] = ()
     trellis_direct_lut: bool = False
-    # B12X_TRELLIS_INKERNEL_ROUTE_PACK: the kernel can build the packed route
-    # layout itself when the host passes the top-k ids (route_ids).
-    inkernel_route_pack: bool = False
-    route_pack_max_routes: int = 128
-    flow_flags: bool = False
 
 
 @dataclass(frozen=True)
