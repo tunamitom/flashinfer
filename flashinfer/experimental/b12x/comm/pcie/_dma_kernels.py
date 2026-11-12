@@ -744,6 +744,266 @@ class _AddLaunch:
                 )
 
 
+@dsl_user_op
+def _pack_fp24x4(
+    v0: Float32, v1: Float32, v2: Float32, v3: Float32, *, loc=None, ip=None
+) -> tuple[Uint32, Uint32, Uint32]:
+    """Pack four IEEE binary32 values to round-to-nearest-even IEEE binary24 (1+8+15 bits).
+
+    Returns (hi01, hi23, lo0123): two 32-bit words of high 16-bit halves and one
+    32-bit word of low 8-bit mantissa bytes. +-Inf, +-0, subnormals, and quiet NaNs
+    preserve their IEEE representation per element with zero cross-element coupling.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32()]),
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .u32 b0, b1, b2, b3, a0, a1, a2, a3, lsb, r0, r1, r2, r3, m01, m23;
+            .reg .pred f0, f1, f2, f3, n0, n1, n2, n3;
+            mov.b32 b0, $3; mov.b32 b1, $4; mov.b32 b2, $5; mov.b32 b3, $6;
+            and.b32 a0, b0, 0x7fffffff; setp.lt.u32 f0, a0, 0x7f800000; setp.gt.u32 n0, a0, 0x7f800000;
+            bfe.u32 lsb, b0, 8, 1; add.u32 r0, lsb, 0x7f; @f0 add.u32 b0, b0, r0; @n0 or.b32 b0, b0, 0x00400000;
+            and.b32 a1, b1, 0x7fffffff; setp.lt.u32 f1, a1, 0x7f800000; setp.gt.u32 n1, a1, 0x7f800000;
+            bfe.u32 lsb, b1, 8, 1; add.u32 r1, lsb, 0x7f; @f1 add.u32 b1, b1, r1; @n1 or.b32 b1, b1, 0x00400000;
+            and.b32 a2, b2, 0x7fffffff; setp.lt.u32 f2, a2, 0x7f800000; setp.gt.u32 n2, a2, 0x7f800000;
+            bfe.u32 lsb, b2, 8, 1; add.u32 r2, lsb, 0x7f; @f2 add.u32 b2, b2, r2; @n2 or.b32 b2, b2, 0x00400000;
+            and.b32 a3, b3, 0x7fffffff; setp.lt.u32 f3, a3, 0x7f800000; setp.gt.u32 n3, a3, 0x7f800000;
+            bfe.u32 lsb, b3, 8, 1; add.u32 r3, lsb, 0x7f; @f3 add.u32 b3, b3, r3; @n3 or.b32 b3, b3, 0x00400000;
+            prmt.b32 $0, b0, b1, 0x7632;
+            prmt.b32 $1, b2, b3, 0x7632;
+            prmt.b32 m01, b0, b1, 0x5151;
+            prmt.b32 m23, b2, b3, 0x5151;
+            prmt.b32 $2, m01, m23, 0x5410;
+        }
+        """,
+        "=r,=r,=r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _unpack_fp24x4(
+    hi01: Uint32, hi23: Uint32, lo0123: Uint32, *, loc=None, ip=None
+) -> tuple[Float32, Float32, Float32, Float32]:
+    """Unpack four IEEE binary24 values into IEEE binary32 in 4 prmt instructions."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(hi01).ir_value(loc=loc, ip=ip),
+            Uint32(hi23).ir_value(loc=loc, ip=ip),
+            Uint32(lo0123).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .u32 u0, u1, u2, u3, zero;
+            mov.u32 zero, 0;
+            prmt.b32 u0, $4, $6, 0x1040;
+            and.b32 u0, u0, 0xffffff00;
+            prmt.b32 u1, $4, $6, 0x3250;
+            and.b32 u1, u1, 0xffffff00;
+            prmt.b32 u2, $5, $6, 0x1060;
+            and.b32 u2, u2, 0xffffff00;
+            prmt.b32 u3, $5, $6, 0x3270;
+            and.b32 u3, u3, 0xffffff00;
+            mov.b32 $0, u0;
+            mov.b32 $1, u1;
+            mov.b32 $2, u2;
+            mov.b32 $3, u3;
+        }
+        """,
+        "=f,=f,=f,=f,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)),
+    )
+
+
+class _DirectRingStepLaunch:
+    """Fused wait + direct BF16 local add + wire decode/encode for zero-copy ring reduce-scatter."""
+
+    def __init__(self, in_mode: str, out_mode: str) -> None:
+        if in_mode not in ("bf16", "fp32", "fp24") or out_mode not in ("fp32", "fp24", "bf16"):
+            raise ValueError(f"unsupported direct ring step modes {in_mode!r} -> {out_mode!r}")
+        self._in_mode = in_mode
+        self._out_mode = out_mode
+
+    @cute.jit
+    def __call__(
+        self,
+        local_bf16_ptr: cute.Pointer,
+        wire_in_ptr: cute.Pointer,
+        scales_in_ptr: cute.Pointer,
+        out_ptr: cute.Pointer,
+        scales_out_ptr: cute.Pointer,
+        wait_pointers: tuple,
+        blocks: Int64,
+        grid_x: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            _one_tensor(local_bf16_ptr),
+            _one_tensor(wire_in_ptr),
+            _one_tensor(scales_in_ptr),
+            _one_tensor(out_ptr),
+            _one_tensor(scales_out_ptr),
+            wait_pointers,
+            blocks,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(_THREADS, 1, 1),
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        local_bf16: cute.Tensor,
+        wire_in: cute.Tensor,
+        scales_in: cute.Tensor,
+        out_data: cute.Tensor,
+        scales_out: cute.Tensor,
+        wait_pointers: tuple,
+        blocks: Int64,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        expected = Uint32(0)
+        if tidx == 0:
+            expected = _wait_flag_read_sys(
+                get_ptr_as_int64(_one_tensor(wait_pointers[0]), Int64(0)),
+                get_ptr_as_int64(_one_tensor(wait_pointers[1]), Int64(0)),
+            )
+        cute.arch.sync_threads()
+        lane = Int32(tidx) & Int32(31)
+        warp = Int32(tidx) >> Int32(5)
+        block = Int64(bidx) * Int64(_WARPS_PER_CTA) + Int64(warp)
+        step = Int64(gdim) * Int64(_WARPS_PER_CTA)
+        while block < blocks:
+            elem0 = block * Int64(_QUANT_BLOCK) + Int64(lane) * Int64(4)
+            a0, a1, a2, a3 = _load_bf16x4(local_bf16, elem0)
+            if cutlass.const_expr(self._in_mode == "bf16"):
+                b0, b1, b2, b3 = _load_bf16x4(wire_in, elem0)
+            elif cutlass.const_expr(self._in_mode == "fp32"):
+                bv = ld_global_v4_f32(get_ptr_as_int64(wire_in, elem0))
+                b0, b1, b2, b3 = bv[0], bv[1], bv[2], bv[3]
+            else:
+                hi01, hi23 = _ld_global_v2_u32(get_ptr_as_int64(wire_in, elem0 // Int64(2)))
+                lo0123 = _ld_global_u32(get_ptr_as_int64(scales_in, elem0 // Int64(4)))
+                b0, b1, b2, b3 = _unpack_fp24x4(hi01, hi23, lo0123)
+            v0 = b0 + a0
+            v1 = b1 + a1
+            v2 = b2 + a2
+            v3 = b3 + a3
+            if cutlass.const_expr(self._out_mode == "fp32"):
+                st_global_v4_f32(get_ptr_as_int64(out_data, elem0), v0, v1, v2, v3)
+            elif cutlass.const_expr(self._out_mode == "bf16"):
+                _store_bf16x4(out_data, elem0, v0, v1, v2, v3)
+            else:
+                p_hi01, p_hi23, p_lo = _pack_fp24x4(v0, v1, v2, v3)
+                _st_global_v2_u32(get_ptr_as_int64(out_data, elem0 // Int64(2)), p_hi01, p_hi23)
+                _st_global_u32(get_ptr_as_int64(scales_out, elem0 // Int64(4)), p_lo)
+            block += step
+        cute.arch.sync_threads()
+        if tidx == 0:
+            _finish_wait_reduce(
+                get_ptr_as_int64(_one_tensor(wait_pointers[2]), Int64(0)),
+                get_ptr_as_int64(_one_tensor(wait_pointers[1]), Int64(0)),
+                expected,
+                Uint32(gdim),
+            )
+
+
+class _DirectWaitCopyLaunch:
+    """Fused wait + 16-byte vectorized copy of a received BF16 broadcast piece into output."""
+
+    @cute.jit
+    def __call__(
+        self,
+        dst_ptr: cute.Pointer,
+        src_ptr: cute.Pointer,
+        wait_pointers: tuple,
+        packs: Int64,
+        grid_x: Int32,
+        stream: cuda.CUstream,
+    ) -> None:
+        self.kernel(
+            _one_tensor(dst_ptr),
+            _one_tensor(src_ptr),
+            wait_pointers,
+            packs,
+        ).launch(
+            grid=(grid_x, 1, 1),
+            block=(_THREADS, 1, 1),
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        dst: cute.Tensor,
+        src: cute.Tensor,
+        wait_pointers: tuple,
+        packs: Int64,
+    ) -> None:
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        gdim, _, _ = cute.arch.grid_dim()
+        expected = Uint32(0)
+        if tidx == 0:
+            expected = _wait_flag_read_sys(
+                get_ptr_as_int64(_one_tensor(wait_pointers[0]), Int64(0)),
+                get_ptr_as_int64(_one_tensor(wait_pointers[1]), Int64(0)),
+            )
+        cute.arch.sync_threads()
+        idx = Int64(bidx) * Int64(_THREADS) + Int64(tidx)
+        step = Int64(gdim) * Int64(_THREADS)
+        while idx < packs:
+            elem0 = idx * Int64(8)
+            words = ld_global_v4_u32(get_ptr_as_int64(src, elem0))
+            st_global_v4_u32(
+                get_ptr_as_int64(dst, elem0),
+                words[0],
+                words[1],
+                words[2],
+                words[3],
+            )
+            idx += step
+        cute.arch.sync_threads()
+        if tidx == 0:
+            _finish_wait_reduce(
+                get_ptr_as_int64(_one_tensor(wait_pointers[2]), Int64(0)),
+                get_ptr_as_int64(_one_tensor(wait_pointers[1]), Int64(0)),
+                expected,
+                Uint32(gdim),
+            )
+
+
 class _QuantLaunch:
     def __init__(self, codec: str) -> None:
         self._codec = codec
@@ -1409,6 +1669,10 @@ class DmaLaunchers:
     dequant_accum: Callable | None = None
     dequant_add_quant_false: Callable | None = None
     dequant_add_quant_true: Callable | None = None
+    # Direct zero-copy ring reduce steps ((in_mode, out_mode), launcher) and the
+    # fused wait+copy broadcast step (L9 dual-wave: bcc93b3's ring transport).
+    direct_steps: tuple[tuple[tuple[str, str], Callable], ...] = ()
+    direct_wait_copy: Callable | None = None
 
     @property
     def __b12x_dependencies__(self):
@@ -1422,6 +1686,8 @@ class DmaLaunchers:
             self.dequant_accum,
             self.dequant_add_quant_false,
             self.dequant_add_quant_true,
+            tuple(launcher for _, launcher in self.direct_steps),
+            self.direct_wait_copy,
         )
 
     @property
@@ -1431,7 +1697,57 @@ class DmaLaunchers:
         return program_keys(self.__b12x_dependencies__)
 
 
-def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
+def _direct_wire_type(mode: str) -> type[cutlass.Numeric]:
+    if mode == "bf16":
+        return cutlass.BFloat16
+    if mode == "fp32":
+        return Float32
+    if mode == "fp24":
+        return Uint32
+    raise ValueError(f"unknown direct wire mode {mode!r}")
+
+
+@functools.cache
+def _compiled_direct_ring_step(in_mode: str, out_mode: str) -> Callable:
+    launch = _DirectRingStepLaunch(in_mode, out_mode)
+    in_type = _direct_wire_type(in_mode)
+    out_type = _direct_wire_type(out_mode)
+    return _compile(
+        "comm.pcie_dma.direct_step",
+        (in_mode, out_mode),
+        launch,
+        _fake_ptr(cutlass.BFloat16, 16),
+        _fake_ptr(in_type, 16),
+        _fake_ptr(Uint32, 16),
+        _fake_ptr(out_type, 16),
+        _fake_ptr(Uint32, 16),
+        tuple(_fake_ptr(Uint32, 4) for _ in range(3)),
+        Int64(1),
+        Int32(1),
+    )
+
+
+@functools.cache
+def _compiled_direct_wait_copy() -> Callable:
+    launch = _DirectWaitCopyLaunch()
+    return _compile(
+        "comm.pcie_dma.direct_wait_copy",
+        ("bf16",),
+        launch,
+        _fake_ptr(cutlass.BFloat16, 16),
+        _fake_ptr(cutlass.BFloat16, 16),
+        tuple(_fake_ptr(Uint32, 4) for _ in range(3)),
+        Int64(1),
+        Int32(1),
+    )
+
+
+def compile_launchers(
+    *,
+    world_size: int,
+    wire_mode: str,
+    direct_variants: Sequence[tuple[str, str]] = (),
+) -> DmaLaunchers:
     """Resolve the primitive programs reachable by declaration metadata."""
 
     if int(world_size) not in (2, 3, 4, 6, 8, 10):
@@ -1456,6 +1772,11 @@ def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
         dequant_add_quant_true=_compiled_dequant_add_quant(codec, True)
         if compressed
         else None,
+        direct_steps=tuple(
+            ((str(in_m), str(out_m)), _compiled_direct_ring_step(str(in_m), str(out_m)))
+            for in_m, out_m in direct_variants
+        ),
+        direct_wait_copy=_compiled_direct_wait_copy() if direct_variants else None,
     )
 
 
@@ -1493,6 +1814,63 @@ class DmaKernels:
         raw(
             _ptr(Uint32, flag_ptr, 4),
             _ptr(Uint32, counter_ptr, 4),
+            current_cuda_stream(),
+        )
+
+    def dma_direct_step(
+        self,
+        in_mode: str,
+        out_mode: str,
+        local_bf16_ptr: int,
+        wire_in_ptr: int,
+        scales_in_ptr: int,
+        out_ptr: int,
+        scales_out_ptr: int,
+        elems: int,
+        *,
+        wait,
+    ) -> None:
+        key = (str(in_mode), str(out_mode))
+        raw = dict(self._require_launchers().direct_steps).get(key)
+        if raw is None:
+            raise RuntimeError(f"DMA direct ring step {key} was not prepared")
+        if int(elems) % _QUANT_BLOCK:
+            raise ValueError("DMA direct ring step requires 128-element aligned pieces")
+        blocks = int(elems) // _QUANT_BLOCK
+        in_type = _direct_wire_type(in_mode)
+        out_type = _direct_wire_type(out_mode)
+        raw(
+            _ptr(cutlass.BFloat16, local_bf16_ptr, 16),
+            _ptr(in_type, wire_in_ptr, 16),
+            _ptr(Uint32, scales_in_ptr, 16),
+            _ptr(out_type, out_ptr, 16),
+            _ptr(Uint32, scales_out_ptr, 16),
+            tuple(_ptr(Uint32, p, 4) for p in wait),
+            blocks,
+            _grid_for_quant_blocks(blocks),
+            current_cuda_stream(),
+        )
+
+    def dma_direct_wait_copy(
+        self,
+        dst_ptr: int,
+        src_ptr: int,
+        elems: int,
+        *,
+        wait,
+    ) -> None:
+        raw = self._require_launchers().direct_wait_copy
+        if raw is None:
+            raise RuntimeError("DMA direct wait-copy launcher was not prepared")
+        if int(elems) % 8:
+            raise ValueError("DMA direct wait-copy requires whole 8-element BF16 packs")
+        packs = int(elems) // 8
+        raw(
+            _ptr(cutlass.BFloat16, dst_ptr, 16),
+            _ptr(cutlass.BFloat16, src_ptr, 16),
+            tuple(_ptr(Uint32, p, 4) for p in wait),
+            packs,
+            _grid_for_packs(packs),
             current_cuda_stream(),
         )
 

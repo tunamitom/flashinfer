@@ -42,6 +42,7 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             "wire_mode": str(runtime._fp8),
             "pieces_override": int(runtime._pieces_override),
             "a2a_chunks_override": int(runtime._a2a_chunks_override),
+            **({"direct_mode": str(runtime.direct_mode)} if getattr(runtime, "direct_mode", "") else {}),
             **dict(call),
         }
     )
@@ -69,6 +70,8 @@ def query_from_runtime(runtime, *, surface: str, call) -> PcieQuery:
             if runtime._fp8_stage is None
             else int(runtime._fp8_stage.numel()),
             "stage_stride": int(runtime._fp8_stage_stride),
+            **({"direct_stage_nbytes": int(runtime._direct_stage.numel())}
+               if getattr(runtime, "_direct_stage", None) is not None else {}),
         }
     )
     return PcieQuery(
@@ -107,9 +110,16 @@ def query_from_metadata(
         strides = contiguous
     if tuple(strides) != contiguous or alignment < 16 or alignment & (alignment - 1):
         raise ValueError("DMA metadata requires contiguous aligned input")
-    if count % (int(runtime.world_size) * 8):
+    direct_mode = getattr(runtime, "direct_mode", "")
+    align_group = 128 if direct_mode else 8
+    if count % (int(runtime.world_size) * align_group):
         raise ValueError("DMA metadata does not satisfy native shard alignment")
-    if count * dtype.itemsize > int(runtime.max_bytes):
+    max_cap = (
+        max(int(runtime.max_bytes), int(getattr(runtime, "_direct_max_shard_elems", 0)) * int(runtime.world_size) * 2)
+        if direct_mode
+        else int(runtime.max_bytes)
+    )
+    if count * dtype.itemsize > max_cap:
         raise ValueError("DMA metadata exceeds existing runtime capacity")
     return query_from_runtime(
         runtime,
@@ -133,9 +143,12 @@ def compile_dma_surface(query_payload, ordinal: int) -> DmaLaunchers:
 
     query = PcieQuery(**dict(query_payload))
     values = _require(query.call, "wire_mode")
+    direct_mode = str(query.call.get("direct_mode", ""))
+    direct_variants = (("bf16", direct_mode), (direct_mode, direct_mode), (direct_mode, "bf16")) if direct_mode else ()
     with torch.cuda.device(int(ordinal)):
         return compile_launchers(
-            world_size=query.world_size, wire_mode=str(values["wire_mode"])
+            world_size=query.world_size, wire_mode=str(values["wire_mode"]),
+            direct_variants=direct_variants,
         )
 
 
@@ -156,6 +169,15 @@ class _DmaExecutionState:
 
     def run(self, inp, *, out=None):
         return self.runtime._run_prepared(inp, out=out, state=self)
+
+    def run_reduce_scatter(self, inp, *, out):
+        self.require_runtime(self.runtime)
+        torch.cuda.set_device(self.runtime.device)
+        return self.runtime._run_direct_bf16(inp, out, reduce_scatter_only=True)
+
+    def prime_reduce_scatter(self, inp, *, out) -> None:
+        self.runtime._prime_prepared(self)
+        self.run_reduce_scatter(inp, out=out)
 
     def prime(self, inp, *, out) -> None:
         """Prime the actual caller-owned collective transport after loading code."""
@@ -215,6 +237,7 @@ def plan(
         required = (
             int(query.setup["slab_nbytes"])
             + int(query.setup["stage_nbytes"])
+            + int(query.setup.get("direct_stage_nbytes", 0))
             + 3 * int(query.setup["flag_slots"]) * 4
         )
         # The runtime owns its IPC slab/stage before declaration; preparation
