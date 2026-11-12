@@ -31,6 +31,23 @@ _PACK_FACTOR = 8
 _STAGES = 4
 
 
+def w4a16_prefill_sms(device_sms: int, size_m: int) -> int:
+    """L9 adaptation: cap the W4A16 prefill launch's SM count when
+    ``B12X_W4A16_NONCOOP_PREFILL_SMS`` is set, leaving SMs free for the
+    priority -1 ring/flag/stats launches during overlapped dual-wave prefill
+    (the knob's reader is g0san's unpushed flashinfer commit; this lands the
+    knob's semantics at the launch geometry). Decode launches (size_m < 128)
+    and unset knobs keep the device's full SM count."""
+
+    value = os.environ.get("B12X_W4A16_NONCOOP_PREFILL_SMS", "")
+    if not value:
+        return int(device_sms)
+    cap = int(value)
+    if cap <= 0:
+        raise ValueError("B12X_W4A16_NONCOOP_PREFILL_SMS must be a positive SM count")
+    return min(int(device_sms), cap) if int(size_m) >= 128 else int(device_sms)
+
+
 def _w4a16_small_m_occupancy() -> int:
     """Resolve the packed NVFP4 small-M schedule: one CTA/four stages or two/three."""
     value = os.environ.get("B12X_W4A16_SMALL_M_OCCUPANCY", "1")

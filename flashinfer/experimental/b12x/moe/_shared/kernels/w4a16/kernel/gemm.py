@@ -108,6 +108,8 @@ from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _scale_group_size,
     _w4a16_pipeline_stages,
     _w4a16_small_m_splitk_enabled,
+
+    w4a16_prefill_sms,
 )
 
 
@@ -486,7 +488,7 @@ class W4A16GemmKernel:
         self.max_m_blocks = int(max_m_blocks)
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
-            self.sms = int(props.multi_processor_count)
+            self.sms = w4a16_prefill_sms(int(props.multi_processor_count), int(self.size_m))
             max_shared_mem = int(
                 getattr(props, "shared_memory_per_block_optin", _DEFAULT_MAX_SHARED_MEM)
             )
