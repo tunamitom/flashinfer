@@ -282,6 +282,9 @@ class PCIeDmaAllReduce:
         self._copied_events = [
             torch.cuda.Event() for _ in range(2 * (self.world_size - 1) * MAX_PIECES)
         ]
+        self._published_events = [
+            torch.cuda.Event() for _ in range(2 * (self.world_size - 1) * MAX_PIECES)
+        ]
         self._input_ready = torch.cuda.Event()
         self._ag_ready = torch.cuda.Event()
         self._a2a_qdone = [torch.cuda.Event() for _ in range(MAX_PIECES)]
@@ -868,6 +871,7 @@ class PCIeDmaAllReduce:
         flag_stream = self._flag_stream
         add_done = self._piece_events
         copied = self._copied_events
+        published = self._published_events
         total_steps = (world - 1) if reduce_scatter_only else 2 * (world - 1)
         done_slot = FLAG_SLOTS - 3
 
@@ -946,12 +950,19 @@ class PCIeDmaAllReduce:
                             self._flag_ptr(nxt, slot(k, p)),
                             self._counter_ptr(self._send_counters, slot(k, p)),
                         )
+                        published[slot(k, p)].record(flag_stream)
                     wait = (
                         self._flag_ptr(rank, slot(k, p)),
                         self._counter_ptr(self._wait_counters, slot(k, p)),
                         self._counter_ptr(self._wait_done, slot(k, p)),
                     )
                     with torch.cuda.stream(ring_stream):
+                        # A rank waits for hop k only after it has published hop k, so no
+                        # execution order of the captured graph can leave every rank waiting
+                        # on a flag its neighbour has not sent (the direct ring's one missing
+                        # edge: the wait and this rank's own send of the same hop were
+                        # unordered nodes, and a graph executor may serialize the wait first).
+                        ring_stream.wait_event(published[slot(k, p)])
                         if reduce_phase:
                             in_m = "bf16" if k == 0 else mid_mode
                             out_m = "bf16" if k == world - 2 else mid_mode

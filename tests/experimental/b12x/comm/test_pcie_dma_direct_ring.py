@@ -146,6 +146,7 @@ def _build_world(monkeypatch, direct_mode: str, shard_elems: int, pieces: int, w
         rt._ring_stream = machine.streams["ring"]
         rt._piece_events = [emulator._Event(machine) for _ in range(pcie_dma.MAX_PIECES)]
         rt._copied_events = [emulator._Event(machine) for _ in range(2 * (world - 1) * pcie_dma.MAX_PIECES)]
+        rt._published_events = [emulator._Event(machine) for _ in range(2 * (world - 1) * pcie_dma.MAX_PIECES)]
         rt._input_ready = emulator._Event(machine)
         rt._kernels = machine
         rt._pieces_override = pieces
@@ -313,3 +314,56 @@ def test_fp24_ring_preserves_bound_across_binades_and_special_values(monkeypatch
         assert abs(rel_l2_fp24 - rel_l2_fp32) / rel_l2_fp32 < 0.01, (rel_l2_fp24, rel_l2_fp32)
         agree = float((res[finite].view(torch.int16) == rounded[finite].view(torch.int16)).float().mean())
         assert agree > 0.99, f"agreement {agree}"
+
+
+@pytest.mark.parametrize("mode,world,pieces,in_place",
+                         [("ar", 8, 2, False), ("ar", 8, 1, True), ("ar", 9, 2, True),
+                          ("rs", 8, 2, False), ("rs", 9, 1, False)])
+def test_adversarial_serialized_graph_order_stays_live_and_bit_identical(monkeypatch, mode, world, pieces, in_place):
+    """The captured-graph executor may serialize independent nodes: collapse each
+    rank's streams into ONE queue in a fixed topological order that prefers the
+    ring stream over the flag and copy streams, the same order on every rank,
+    then run the queues serially with the ranks interleaved. With the direct
+    ring's publish-to-wait edge every queue stays live and the outputs are
+    bit-identical to the ordered reference; without the edge (75f843cec) every
+    rank's queue places its hop-k waits ahead of its own hop-k sends and all the
+    queues stall — the queued-replay deadlock, seen in the model.
+    """
+    shard_elems = 512
+    rs = mode == "rs"
+    pcie_dma, space, machines, runtimes = _build_world(monkeypatch, "fp32", shard_elems, pieces, world)
+    gen = torch.Generator().manual_seed(601 + world + pieces + int(in_place))
+    inputs = (
+        torch.randn((world, world, shard_elems), generator=gen)
+        * torch.pow(2.0, torch.randint(-10, 11, (world, world, shard_elems), generator=gen).float())
+    ).to(torch.bfloat16)
+    inputs[0, 3 % world, 5] = float("inf")
+    inputs[0, 5 % world, 9] = float("nan")
+
+    results = [None] * world
+    for rank, (machine, rt) in enumerate(zip(machines, runtimes)):
+        src = _Tensor(space, world * shard_elems, torch.bfloat16)
+        dst = src if (in_place and not rs) else _Tensor(space, shard_elems if rs else world * shard_elems, torch.bfloat16)
+        monkeypatch.setattr(pcie_dma.torch.cuda, "current_stream", lambda device=None, m=machine: m.main)
+        monkeypatch.setattr(pcie_dma.torch.cuda, "stream", machine.stream)
+        machine.main.operations.append(
+            ("host", lambda rank=rank, src=src: space.bf16(src.address, world * shard_elems).copy_(inputs[rank].reshape(-1)))
+        )
+        rt._run_direct_bf16(src, dst, reduce_scatter_only=rs)
+        machine.main.operations.append(
+            ("host", lambda rank=rank, dst=dst, rs=rs: results.__setitem__(
+                rank, space.bf16(dst.address, shard_elems if rs else world * shard_elems).clone()))
+        )
+
+    orders = emulator._collapse(machines)
+    shapes = [[op[0] for op in queue] for queue in orders]
+    assert all(shape == shapes[0] for shape in shapes), "the collapsed order differs across ranks"
+    emulator._execute_collapsed(space, orders, seed=71)  # must not stall
+
+    expected = _reference_rs_bf16(inputs, world) if rs else _reference_ring_bf16(inputs, world)
+    for rank in range(world):
+        got = results[rank]
+        want = expected[rank] if rs else expected
+        nan_mask = torch.isnan(want)
+        assert torch.equal(torch.isnan(got), nan_mask), rank
+        assert torch.equal(got[~nan_mask].view(torch.int16), want[~nan_mask].view(torch.int16)), rank
