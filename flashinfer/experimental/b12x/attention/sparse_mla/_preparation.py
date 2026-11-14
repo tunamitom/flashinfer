@@ -263,6 +263,7 @@ class _SparseMlaState:
                     sm_scale=self.caps.softmax_scale,
                     page_block_size=self.caps.page_size,
                     topk_length=binding.nsa_cache_seqlens_int32,
+                    attn_sink=attention_sink,
                     output=binding.scratch.output_buffer[: binding.q.shape[0]],
                     lse_out=binding.scratch.final_lse[
                         : binding.q.shape[0], : binding.q.shape[1]
@@ -306,6 +307,7 @@ class _SparseMlaState:
             sm_scale=self.caps.softmax_scale,
             page_block_size=self.caps.page_size,
             topk_length=binding.nsa_cache_seqlens_int32,
+            attn_sink=attention_sink,
             output=(
                 binding.scratch.output_buffer[: binding.q.shape[0]]
                 if getattr(binding.scratch, "output_buffer", None) is not None

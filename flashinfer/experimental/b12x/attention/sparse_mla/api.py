@@ -88,8 +88,10 @@ def bind(
         raise ValueError(
             "attention_sink presence must match plan.caps.has_attention_sink"
         )
-    if attention_sink is not None and caps.mode != "decode":
-        raise ValueError("attention_sink is supported only by sparse MLA decode")
+    # Sinks are supported in every mode (decode, extend, verify, draft_extend):
+    # the MG prefill kernel folds the per-head sink into the normalizer and LSE
+    # exactly like the decode epilogue. Hy4 (GPT-OSS-style learnable per-head
+    # sink logits) needs the same fold on prefill/extend/verify.
     if attention_sink is not None:
         if attention_sink.shape != (caps.num_q_heads,):
             raise ValueError(
