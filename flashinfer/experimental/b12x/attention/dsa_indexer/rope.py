@@ -18,6 +18,13 @@ The split-half (NeoX) rotation is the mutant and must stay dead: the
 checkpoint stores q_pe/k_pe in interleaved layout, so the split-half form
 rotates the wrong dim pairs, loses the trained relative-position geometry
 and corrupts the DSA top-k selection.
+
+QUERY SIDE (``prepare_indexer_queries``): the witness rotates the indexer
+queries the same way — pe in the LAST ``qk_rope_head_dim`` = 64 dims,
+adjacent-pair interleaved rotation, ``rope_theta = 1e7`` — but the queries
+get NO ``k_norm`` (only keys pass ``self.k_norm`` in the witness) and they
+are rotated per call, not at cache-write time: query RoPE depends on the
+query's own position and cannot be baked into any cache.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ __all__ = [
     "apply_indexer_rope",
     "indexer_k_norm",
     "prepare_indexer_keys",
+    "prepare_indexer_queries",
 ]
 
 
@@ -177,3 +185,37 @@ def prepare_indexer_keys(
         k, weight=k_norm_weight, bias=k_norm_bias, eps=k_norm_eps
     )
     return apply_indexer_rope(k_normed, positions, rope_dim=rope_dim, theta=theta)
+
+
+def prepare_indexer_queries(
+    q: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    rope_dim: int = INDEX_ROPE_DIM,
+    theta: float = INDEX_ROPE_THETA,
+) -> torch.Tensor:
+    """Indexer query preparation: interleaved RoPE over the trailing pe block,
+    NO norm.
+
+    ``q`` is ``[tokens, INDEX_HEAD_DIM]`` (or ``[tokens, heads,
+    INDEX_HEAD_DIM]`` — every head rotates identically) raw projected queries,
+    the witness's ``wq_b`` output before quantization.  Order matches
+    ``Indexer.prepare_inputs``: the checkpoint layout keeps the rotary block in
+    the LAST ``rope_dim`` dims (``torch.split(q, [head_dim - rope_dim,
+    rope_dim])``), only that block rotates (adjacent-pair interleaved,
+    ``is_neox_style=False``, ``rope_theta``), and the result is reassembled
+    nope-first.
+
+    Queries get NO ``k_norm``: the witness normalizes keys only
+    (``k = self.k_norm(k)``; ``q`` goes straight from ``wq_b`` to the split).
+    Applying the key norm here is as wrong as the NeoX rotation — it moves the
+    query off the trained score geometry and corrupts the DSA top-k selection.
+    """
+    if q.ndim < 2:
+        raise ValueError(f"q must be rank >= 2, got {tuple(q.shape)}")
+    if int(q.shape[-1]) != INDEX_HEAD_DIM:
+        raise ValueError(
+            f"q must have {INDEX_HEAD_DIM} columns (got {int(q.shape[-1])}); "
+            "indexer queries are INDEX_HEAD_DIM wide"
+        )
+    return apply_indexer_rope(q, positions, rope_dim=rope_dim, theta=theta)
