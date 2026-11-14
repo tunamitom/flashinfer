@@ -1244,21 +1244,45 @@ class PCIeDCPA2A:
         )
         if sink is not None:
             # Post-merge sink step, applied exactly once for the whole merge.
-            # ``apply_attention_sink_after_merge`` scales ``out`` in place and
-            # RETURNS the folded LSE; write it back so the caller's ``lse_out``
-            # (the graph-capture operand) carries ``logaddexp(lse, sink)``.
+            # Prepared operator (defect 13): one allocation-free Triton launch
+            # folding ``out`` and ``lse_out`` in place — the eager FP64 torch
+            # fold with its per-call allocations is gone from this path.
             assert lse_out is not None
-            _, folded_lse = apply_attention_sink_after_merge(
-                out,
-                lse_out,
-                sink,
-                lse_base=lse_base,
-                partials_sink_folded=False,  # validated at the public entry
-            )
-            lse_out.copy_(folded_lse)
+            self._fold_sink_prepared(out, lse_out, sink, lse_base=lse_base)
         if return_lse:
             return out, lse_out
         return out
+
+    def _fold_sink_prepared(
+        self,
+        out: torch.Tensor,
+        lse_out: torch.Tensor,
+        sink: torch.Tensor,
+        *,
+        lse_base: str,
+    ) -> None:
+        """Run the prepared post-merge sink fold, preparing it on first use."""
+        from ._sink_fold import prepare_sink_fold
+
+        prepared = getattr(self, "_sink_fold_op", None)
+        spec = (int(out.shape[0]), int(out.shape[1]), int(out.shape[2]), out.dtype, lse_base)
+        if prepared is None or (
+            prepared.batch,
+            prepared.heads,
+            prepared.head_dim,
+            prepared.out_dtype,
+            prepared.lse_base,
+        ) != spec:
+            if _is_current_stream_capturing(self.device):
+                raise RuntimeError(
+                    "the prepared sink fold must be built (prepare_sink_fold) "
+                    "before CUDA-graph capture"
+                )
+            prepared = prepare_sink_fold(
+                out=out, lse=lse_out, sink=sink, lse_base=lse_base
+            )
+            self._sink_fold_op = prepared
+        prepared.run(out, lse_out, sink)
 
     def _launch_lse_reduce_scatter(
         self,
