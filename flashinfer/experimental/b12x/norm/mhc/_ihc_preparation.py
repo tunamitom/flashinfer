@@ -57,6 +57,13 @@ def _compile_ihc(query_payload, config_payload, ordinal):
     hidden, total_k = query.hidden_size, IHC_MULT * query.hidden_size
     warp = config.num_warps
     programs = {}
+    # The norm-weight pointer slot must warm the dtype the run passes: the
+    # folded operand when the query declares one (`require` pins its dtype),
+    # else the fp32 `hc_base` dummy the launchers hand Triton. Warming any
+    # other pointer dtype compiles a second specialization at the first real
+    # forward — the plan's warmed program must match the launch exactly.
+    norm_ptr_dtype = (getattr(torch, query.norm_weight_dtype)
+                      if query.has_norm_weight else torch.float32)
     if query.operation == "pre":
         programs["pre"] = kernels._ihc_pre_kernel.warmup(
             torch.bfloat16,
@@ -70,7 +77,7 @@ def _compile_ihc(query_payload, config_payload, ordinal):
             float(query.magnitude),
             float(query.hc_eps),
             float(query.norm_eps),
-            torch.float32,
+            norm_ptr_dtype,
             float(query.layernorm_eps),
             BLOCK_K=config.block_k,
             BLOCK_D=config.block_d,
@@ -106,7 +113,7 @@ def _compile_ihc(query_payload, config_payload, ordinal):
             float(query.magnitude),
             float(query.hc_eps),
             float(query.norm_eps),
-            torch.float32,
+            norm_ptr_dtype,
             float(query.layernorm_eps),
             BLOCK_K=config.block_k,
             BLOCK_D=config.block_d,
