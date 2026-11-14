@@ -47,6 +47,49 @@ def _align_up(value: int, alignment: int = _ALIGN_BYTES) -> int:
     return (int(value) + int(alignment) - 1) // int(alignment) * int(alignment)
 
 
+_STABLE_ALIGN_BYTES = 16
+
+
+def _stable_pack_offsets(
+    topk_offset_bytes: int,
+    workspace_q_rows: int,
+    stable_topk_blocks: int,
+    group_budget: int,
+) -> tuple[int, int, int, int, int, int, int]:
+    """Sub-view offsets of the stable-selection pack inside the top-k workspace.
+
+    Every sub-view starts 16-byte aligned: ``_copy_stable_topk_kernel`` compiles
+    its ``tl.load`` of ``stable_values``/``stable_ids`` to 16-byte vectorized
+    global loads, and an 8-mod-16 base raises CUDA_ERROR_MISALIGNED_ADDRESS
+    (NVRM Xid 13) on SM120. The trailing element is the pack's total size.
+    """
+    stable_count_nbytes = workspace_q_rows * stable_topk_blocks * torch.int32.itemsize
+    value_nbytes = workspace_q_rows * group_budget * torch.float32.itemsize
+    id_nbytes = workspace_q_rows * group_budget * torch.int32.itemsize
+    scalar_nbytes = workspace_q_rows * torch.float32.itemsize
+    count_id_nbytes = workspace_q_rows * torch.int32.itemsize
+
+    def _pack(offset: int, nbytes: int) -> tuple[int, int]:
+        offset = _align_up(offset, _STABLE_ALIGN_BYTES)
+        return offset, offset + nbytes
+
+    tie_offset, next_offset = _pack(topk_offset_bytes, stable_count_nbytes)
+    greater_offset, next_offset = _pack(next_offset, stable_count_nbytes)
+    values_offset, next_offset = _pack(next_offset, value_nbytes)
+    ids_offset, next_offset = _pack(next_offset, id_nbytes)
+    thresholds_offset, next_offset = _pack(next_offset, scalar_nbytes)
+    greater_totals_offset, next_offset = _pack(next_offset, count_id_nbytes)
+    return (
+        tie_offset,
+        greater_offset,
+        values_offset,
+        ids_offset,
+        thresholds_offset,
+        greater_totals_offset,
+        next_offset - int(topk_offset_bytes),
+    )
+
+
 def _is_power_of_two(value: int) -> bool:
     value = int(value)
     return value > 0 and value & (value - 1) == 0
@@ -903,13 +946,12 @@ def _scratch_layout(
         workspace_q_rows * int(caps.group_budget) * torch.int32.itemsize
     )
     stable_topk_blocks = math.ceil(score_workspace_width / _STABLE_TOPK_BLOCK)
-    stable_topk_nbytes = (
-        2 * workspace_q_rows * stable_topk_blocks * torch.int32.itemsize
-        + workspace_q_rows
-        * int(caps.group_budget)
-        * (torch.float32.itemsize + torch.int32.itemsize)
-        + workspace_q_rows * (torch.float32.itemsize + torch.int32.itemsize)
-    )
+    stable_topk_nbytes = _stable_pack_offsets(
+        0,
+        workspace_q_rows,
+        stable_topk_blocks,
+        int(caps.group_budget),
+    )[-1]
     topk_workspace_nbytes = _align_up(
         max(_MIN_TOPK_WORKSPACE_BYTES, stable_topk_nbytes)
     )
@@ -2563,46 +2605,53 @@ def _qsa_decode_impl(
         dtype=torch.int32,
     )
     stable_topk_blocks = math.ceil(int(score_workspace_width) / _STABLE_TOPK_BLOCK)
-    stable_offset = int(topk_offset_bytes)
-    stable_count_nbytes = work_rows * stable_topk_blocks * torch.int32.itemsize
+    (
+        tie_offset,
+        greater_offset,
+        stable_values_offset,
+        stable_ids_offset,
+        thresholds_offset,
+        greater_totals_offset,
+        _stable_pack_nbytes,
+    ) = _stable_pack_offsets(
+        int(topk_offset_bytes),
+        work_rows,
+        stable_topk_blocks,
+        group_budget,
+    )
     tie_counts = _scratch_view(
         scratch,
-        offset_bytes=stable_offset,
+        offset_bytes=tie_offset,
         shape=(work_rows, stable_topk_blocks),
         dtype=torch.int32,
     )
-    stable_offset += stable_count_nbytes
     greater_counts = _scratch_view(
         scratch,
-        offset_bytes=stable_offset,
+        offset_bytes=greater_offset,
         shape=(work_rows, stable_topk_blocks),
         dtype=torch.int32,
     )
-    stable_offset += stable_count_nbytes
     stable_values = _scratch_view(
         scratch,
-        offset_bytes=stable_offset,
+        offset_bytes=stable_values_offset,
         shape=(work_rows, group_budget),
         dtype=torch.float32,
     )
-    stable_offset += work_rows * group_budget * torch.float32.itemsize
     stable_ids = _scratch_view(
         scratch,
-        offset_bytes=stable_offset,
+        offset_bytes=stable_ids_offset,
         shape=(work_rows, group_budget),
         dtype=torch.int32,
     )
-    stable_offset += work_rows * group_budget * torch.int32.itemsize
     thresholds = _scratch_view(
         scratch,
-        offset_bytes=stable_offset,
+        offset_bytes=thresholds_offset,
         shape=(work_rows,),
         dtype=torch.float32,
     )
-    stable_offset += work_rows * torch.float32.itemsize
     greater_totals = _scratch_view(
         scratch,
-        offset_bytes=stable_offset,
+        offset_bytes=greater_totals_offset,
         shape=(work_rows,),
         dtype=torch.int32,
     )
