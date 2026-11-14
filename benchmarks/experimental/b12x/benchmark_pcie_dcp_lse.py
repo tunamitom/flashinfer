@@ -84,7 +84,9 @@ def main():
             dist.barrier()
             with session.capture(), pool.capture(), torch.cuda.graph(graph):
                 for _ in range(16):
-                    runtime.lse_reduce_scatter(partial, lse, out=out, plan=plan)
+                    runtime.lse_reduce_scatter(
+                        partial, lse, out=out, plan=plan, lse_base="natural"
+                    )
             for step in range(5):
                 generator = torch.Generator().manual_seed(args.seed + step)
                 values = torch.randn((world, *partial.shape), generator=generator).to(
@@ -101,7 +103,7 @@ def main():
                 partial.copy_(values[rank])
                 lse.copy_(scores[rank])
                 expected = lse_reduce_scatter_reference(
-                    values.to(device), scores.to(device), rank
+                    values.to(device), scores.to(device), rank, lse_base="natural"
                 )
                 out.fill_(float("nan"))
                 torch.cuda.synchronize()

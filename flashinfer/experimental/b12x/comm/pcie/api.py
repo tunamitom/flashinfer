@@ -15,6 +15,11 @@ from .pcie_dcp_a2a import (
 from .pcie_dcp_a2a import (
     kimi_topk16,
     lse_reduce_scatter_reference,
+    apply_attention_sink_after_merge,
+)
+from ._sink_fold import (
+    PreparedSinkFold,
+    prepare_sink_fold,
 )
 from .pcie_dcp_topk import (
     PCIeDCPTopKOwnerExchange as DcpTopKOwnerExchange,
@@ -81,6 +86,9 @@ __all__ = [
     "kimi_topk16",
     "parse_oneshot_max_size",
     "lse_reduce_scatter_reference",
+    "apply_attention_sink_after_merge",
+    "PreparedSinkFold",
+    "prepare_sink_fold",
     "owner_stage_reference",
     "is_supported",
 ]

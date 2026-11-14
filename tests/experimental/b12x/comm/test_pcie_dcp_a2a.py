@@ -54,6 +54,7 @@ class _FakeRuntime(PCIeDCPA2A):
         partial_lse,
         out,
         *,
+        lse_out=None,
         slot,
         natural_log,
         threads,
@@ -72,6 +73,8 @@ class _FakeRuntime(PCIeDCPA2A):
         )
         heads_per_rank = partial_output.shape[1] // 2
         out.copy_(partial_output[:, :heads_per_rank])
+        if lse_out is not None:
+            lse_out.copy_(partial_lse[:, :heads_per_rank])
 
     def _launch_all_gather_heads(
         self,
@@ -259,7 +262,7 @@ def test_a2a_epoch_change_bumps_both_compile_specs() -> None:
         (
             kernels._get_compiled_lse_reduce_scatter,
             "comm.pcie.dcp_a2a.lse_reduce_scatter",
-            35,
+            36,
         ),
         (
             kernels._get_compiled_all_gather_heads,
@@ -354,10 +357,16 @@ def test_lse_log_base_is_a_runtime_kernel_argument() -> None:
         in inspect.signature(kernels._LseReduceScatterLaunch.kernel).parameters
     )
     source = inspect.getsource(kernels._LseReduceScatterLaunch.kernel)
-    assert source.count("if natural_log != Int32(0):") == 1
+    # Two runtime log-base branches: the softmax weights (exp/exp2) and the
+    # merged-LSE store (log/log2) — both must honour the runtime natural_log
+    # argument rather than baking the base into the compile key.
+    assert source.count("if natural_log != Int32(0):") == 2
     branch = source.split("if natural_log != Int32(0):", maxsplit=1)[1]
     assert "cute.math.exp(delta, fastmath=False)" in branch
     assert "cute.math.exp2(delta, approx=True)" in branch
+    lse_branch = branch.split("if natural_log != Int32(0):", maxsplit=1)[1]
+    assert "cute.math.log(" in lse_branch
+    assert "cute.math.log2(" in lse_branch
 
 
 def test_lse_uses_one_runtime_selected_lse_load_per_lane() -> None:
@@ -556,8 +565,8 @@ def test_reference_selects_destination_heads_and_combines_lse_weights():
         ]
     )
 
-    rank0 = lse_reduce_scatter_reference(outputs, lses, 0)
-    rank1 = lse_reduce_scatter_reference(outputs, lses, 1)
+    rank0 = lse_reduce_scatter_reference(outputs, lses, 0, lse_base="natural")
+    rank1 = lse_reduce_scatter_reference(outputs, lses, 1, lse_base="natural")
 
     torch.testing.assert_close(rank0, torch.tensor([[[2.0], [2.0]]]))
     torch.testing.assert_close(rank1, torch.tensor([[[20.0], [0.0]]]))
@@ -573,7 +582,7 @@ def test_reference_ignores_nan_output_from_empty_shard():
     ).reshape(2, 1, 2, 1)
     lses = torch.tensor([[[-torch.inf, 0.0]], [[0.0, 0.0]]])
 
-    actual = lse_reduce_scatter_reference(outputs, lses, 0)
+    actual = lse_reduce_scatter_reference(outputs, lses, 0, lse_base="natural")
 
     torch.testing.assert_close(actual, torch.tensor([[[4.0]]]))
 

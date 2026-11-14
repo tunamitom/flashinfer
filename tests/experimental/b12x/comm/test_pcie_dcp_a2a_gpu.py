@@ -104,6 +104,7 @@ def _reference(
         torch.stack([item[0] for item in inputs]),
         torch.stack([item[1] for item in inputs]),
         rank,
+        lse_base="natural",
     )
 
 
@@ -265,6 +266,7 @@ def _check_eager(
                 partial_output,
                 partial_lse,
                 plan=plans["lse_reduce_scatter", dtype],
+                lse_base="natural",
                 channel_id="eager:dcp",
             )
             if guard_reduce:
@@ -303,6 +305,7 @@ def _check_eager(
                 partial_lse,
                 out=head_major_output,
                 plan=plans["lse_reduce_scatter", dtype],
+                lse_base="natural",
                 channel_id="eager:dcp",
             )
             torch.cuda.synchronize(device)
@@ -384,6 +387,7 @@ def _check_eager_adjacency(
         partial_lse,
         reduced,
         plan=plans["lse_reduce_scatter", partial_output.dtype],
+        lse_base="natural",
     )
     channel.all_gather_heads(
         second_query, second_gather, plan=plans["all_gather_heads", second_query.dtype]
@@ -486,6 +490,7 @@ def _check_graph(
             lses[0],
             outputs[0],
             plan=plans["lse_reduce_scatter", inputs[0].dtype],
+            lse_base="natural",
         )
     stream.synchronize()
     dist.barrier()
@@ -506,6 +511,7 @@ def _check_graph(
                     lses[layer],
                     outputs[layer],
                     plan=graph_plans["lse_reduce_scatter", inputs[layer].dtype],
+                    lse_base="natural",
                 )
     stream.synchronize()
 
@@ -821,6 +827,7 @@ def _check_queued_mixed_grid_graph(
                 partial_lse,
                 reduced,
                 plan=plans["lse_reduce_scatter", partial_output.dtype],
+                lse_base="natural",
             )
             channel.all_gather_heads(
                 query_b, gathered_b, plan=plans["all_gather_heads", query_b.dtype]

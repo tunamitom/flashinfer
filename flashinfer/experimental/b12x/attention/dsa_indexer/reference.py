@@ -6,6 +6,12 @@ import math
 
 import torch
 
+from .rope import (
+    INDEX_K_NORM_EPS,
+    INDEX_ROPE_DIM,
+    INDEX_ROPE_THETA,
+    prepare_indexer_keys,
+)
 
 _FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 _INDEX_HEAD_DIM = 128
@@ -94,11 +100,37 @@ def pack_index_k_cache_reference(
     k: torch.Tensor,
     *,
     page_size: int = 64,
+    positions: torch.Tensor | None = None,
+    k_norm_weight: torch.Tensor | None = None,
+    k_norm_bias: torch.Tensor | None = None,
+    k_norm_eps: float = INDEX_K_NORM_EPS,
+    rope_theta: float = INDEX_ROPE_THETA,
+    rope_dim: int = INDEX_ROPE_DIM,
 ) -> torch.Tensor:
-    """Pack dequantized index-K rows into the paged FP8+scale cache layout."""
+    """Pack dequantized index-K rows into the paged FP8+scale cache layout.
+
+    Keys are rotated at write time: pass ``positions`` to run the Hy4
+    indexer-key preparation (:func:`.rope.prepare_indexer_keys` — full-128
+    ``k_norm`` then interleaved RoPE over the LAST ``rope_dim`` dims) before
+    quantization, so the paged index cache stores post-rope keys and the
+    scorer never rotates.  With ``positions=None`` the rows are packed
+    verbatim (no norm, no rotation).
+    """
 
     if page_size <= 0:
         raise ValueError(f"page_size must be positive, got {page_size}")
+    if positions is None and (k_norm_weight is not None or k_norm_bias is not None):
+        raise ValueError("k_norm_weight/k_norm_bias require positions")
+    if positions is not None:
+        k = prepare_indexer_keys(
+            k,
+            positions,
+            k_norm_weight=k_norm_weight,
+            k_norm_bias=k_norm_bias,
+            k_norm_eps=k_norm_eps,
+            rope_dim=rope_dim,
+            theta=rope_theta,
+        )
 
     k_matrix = _as_k_matrix(k).to(torch.float32)
     num_tokens = k_matrix.shape[0]

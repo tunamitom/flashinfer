@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 
 import torch
@@ -263,6 +264,7 @@ class _SparseMlaState:
                     sm_scale=self.caps.softmax_scale,
                     page_block_size=self.caps.page_size,
                     topk_length=binding.nsa_cache_seqlens_int32,
+                    attn_sink=attention_sink,
                     output=binding.scratch.output_buffer[: binding.q.shape[0]],
                     lse_out=binding.scratch.final_lse[
                         : binding.q.shape[0], : binding.q.shape[1]
@@ -299,13 +301,14 @@ class _SparseMlaState:
             )
         from b12x.attention._shared.mla.prefill import run_unified_prefill
 
-        return run_unified_prefill(
+        result = run_unified_prefill(
             q=binding.q,
             kv_cache=kv_cache,
             topk_indices=binding.selected_indices,
             sm_scale=self.caps.softmax_scale,
             page_block_size=self.caps.page_size,
             topk_length=binding.nsa_cache_seqlens_int32,
+            attn_sink=attention_sink,
             output=(
                 binding.scratch.output_buffer[: binding.q.shape[0]]
                 if getattr(binding.scratch, "output_buffer", None) is not None
@@ -324,6 +327,19 @@ class _SparseMlaState:
             prepared=self.prepared,
             mg_enabled=self.query.prefill_mg_enabled,
         )
+        # Enforce the declared LSE base at the API boundary (defect 12): the
+        # prefill/extend/verify kernel writes base-2 LSE whatever
+        # ``caps.lse_scale`` says, while decode's epilogue honours it.  The
+        # boundary guarantees the DECLARED base — a natural-log declaration
+        # converts here instead of silently returning base-2 to a caller that
+        # will merge it as natural logs.
+        if self.caps.lse_scale == "natural":
+            output, lse = result
+            if lse is None:
+                return output, lse
+            lse = lse.mul_(math.log(2.0)) if lse.is_contiguous() else lse * math.log(2.0)
+            return output, lse
+        return result
 
 
 def plan(
