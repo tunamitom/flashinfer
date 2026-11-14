@@ -95,7 +95,9 @@ def test_reference_sink_applied_exactly_once(world: int) -> None:
             stacked_out.float(),
             stacked_lse.float(),
             rank,
+            lse_base="natural",
             attention_sink=sink.float(),
+            partials_sink_folded=False,
             return_lse=True,
         )
         head_slice = slice(rank * (heads // world), (rank + 1) * (heads // world))
@@ -125,7 +127,7 @@ def test_mutant_sink_disabled_dies(world: int) -> None:
     )
     for rank in range(world):
         merged = lse_reduce_scatter_reference(
-            stacked_out.float(), stacked_lse.float(), rank
+            stacked_out.float(), stacked_lse.float(), rank, lse_base="natural"
         )
         head_slice = slice(rank * (heads // world), (rank + 1) * (heads // world))
         assert not torch.allclose(
@@ -160,6 +162,8 @@ def test_mutant_per_rank_fold_dies(world: int) -> None:
                 stacked_out[r].float().clone(),
                 stacked_lse[r].float(),
                 sink.float(),
+                lse_base="natural",
+                partials_sink_folded=False,
             )
             per_rank_out.append(out_r)
             per_rank_lse.append(lse_r)
@@ -167,7 +171,7 @@ def test_mutant_per_rank_fold_dies(world: int) -> None:
         mutated_lse = torch.stack(per_rank_lse)
         # ... then merge without any post-merge step.
         merged = lse_reduce_scatter_reference(
-            mutated, mutated_lse, rank, is_lse_base_on_e=True
+            mutated, mutated_lse, rank, lse_base="natural"
         )
         head_slice = slice(rank * (heads // world), (rank + 1) * (heads // world))
         assert not torch.allclose(
@@ -187,7 +191,7 @@ def test_post_merge_fold_matches_decode_epilogue_form() -> None:
     lse = torch.randn(batch, heads, dtype=torch.float32) + 6.0
     sink = torch.linspace(-1.0, 8.0, heads, dtype=torch.float32)
     folded_out, folded_lse = apply_attention_sink_after_merge(
-        out.clone(), lse, sink
+        out.clone(), lse, sink, lse_base="natural", partials_sink_folded=False
     )
     factor = torch.sigmoid(lse.double() - sink.double().unsqueeze(0))
     expected_out = out.double() * factor.unsqueeze(-1)
@@ -201,7 +205,11 @@ def test_post_merge_fold_matches_decode_epilogue_form() -> None:
 
     # Base-2 LSE variant gives the same output fold and the base-2 LSE fold.
     folded2_out, folded2_lse = apply_attention_sink_after_merge(
-        out.clone(), lse / LN2, sink, is_lse_base_on_e=False
+        out.clone(),
+        lse / LN2,
+        sink,
+        lse_base="base2",
+        partials_sink_folded=False,
     )
     torch.testing.assert_close(folded2_out.double(), expected_out, rtol=1e-6, atol=1e-7)
     torch.testing.assert_close(
@@ -212,7 +220,7 @@ def test_post_merge_fold_matches_decode_epilogue_form() -> None:
     empty_out = torch.zeros(1, heads, head_dim, dtype=torch.float32)
     empty_lse = torch.full((1, heads), -float("inf"), dtype=torch.float32)
     folded_out, folded_lse = apply_attention_sink_after_merge(
-        empty_out.clone(), empty_lse, sink
+        empty_out.clone(), empty_lse, sink, lse_base="natural", partials_sink_folded=False
     )
     assert bool((folded_out == 0).all().item())
     torch.testing.assert_close(
@@ -225,9 +233,321 @@ def test_post_merge_fold_rejects_head_mismatch() -> None:
     out = torch.zeros(2, 4, 8)
     lse = torch.zeros(2, 4)
     with pytest.raises(ValueError, match="attention_sink must cover"):
-        apply_attention_sink_after_merge(out, lse, torch.zeros(3))
+        apply_attention_sink_after_merge(
+            out, lse, torch.zeros(3), lse_base="natural", partials_sink_folded=False
+        )
     with pytest.raises(ValueError, match="merged_lse must match"):
-        apply_attention_sink_after_merge(out, torch.zeros(2, 5), torch.zeros(4))
+        apply_attention_sink_after_merge(
+            out,
+            torch.zeros(2, 5),
+            torch.zeros(4),
+            lse_base="natural",
+            partials_sink_folded=False,
+        )
+
+
+# ─────────────────────── defect 10: empty rows are -inf ─────────────────────
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("lse_base", ["natural", "base2"])
+def test_empty_row_reference_returns_neg_inf(lse_base: str) -> None:
+    """An all-empty row must return -inf, not a clamp floor (defect 10).
+
+    The in-place ``weight_sum.clamp_min_(1e-10)`` bug turned the empty row's
+    0 into 1e-10 and reported ``log(1e-10) = -23.03`` (``log2`` = -33.2 in
+    base 2).  Exact -inf is the contract: no rank contributed a finite LSE.
+    """
+    world, batch, heads, head_dim = 2, 3, 4, 8
+    out = torch.randn(world, batch, heads, head_dim, dtype=torch.float64)
+    lses = torch.randn(world, batch, heads, dtype=torch.float64)
+    # Row 1 is empty on EVERY rank (and one head of row 0 too).
+    lses[:, 1, :] = -torch.inf
+    lses[:, 0, 2] = -torch.inf
+    lses_in = lses if lse_base == "natural" else lses / LN2
+    for rank in range(world):
+        merged, merged_lse = lse_reduce_scatter_reference(
+            out.float(),
+            lses_in.float(),
+            rank,
+            lse_base=lse_base,
+            return_lse=True,
+        )
+        head_slice = slice(rank * (heads // world), (rank + 1) * (heads // world))
+        empty = merged_lse[1]  # batch row 1 is empty on EVERY rank
+        assert bool(torch.isneginf(empty).all().item()), (
+            f"rank {rank} empty rows must be exactly -inf, got {empty.tolist()} "
+            f"(a clamp floor near -23.03/-33.2 is the defect-10 bug)"
+        )
+        # The empty ROW's output must be zero, not garbage.
+        assert bool((merged[1] == 0).all().item())
+        # Batch row 0 is live except for head 2 (empty on every rank): rank 1's
+        # shard holds heads 2..3, so its first entry is -inf and its second
+        # finite; rank 0's two entries are finite. Batch row 2 is fully live.
+        if rank == 0:
+            assert bool(torch.isfinite(merged_lse[0]).all().item())
+        else:
+            assert bool(torch.isneginf(merged_lse[0, 0]).item())
+            assert bool(torch.isfinite(merged_lse[0, 1]).item())
+        assert bool(torch.isfinite(merged_lse[2]).all().item())
+        # Empty rows folded with a sink collapse to the sink exactly (reported
+        # in the declared base).
+        sink = torch.linspace(-1.0, 2.0, heads, dtype=torch.float32)
+        _, folded_lse = lse_reduce_scatter_reference(
+            out.float(),
+            lses_in.float(),
+            rank,
+            lse_base=lse_base,
+            attention_sink=sink,
+            partials_sink_folded=False,
+            return_lse=True,
+        )
+        expected_sink = sink[head_slice] / LN2 if lse_base == "base2" else sink[head_slice]
+        torch.testing.assert_close(folded_lse[1], expected_sink)
+
+
+# ──────────────────── defect 11: double-fold rejected loudly ─────────────────
+
+
+@pytest.mark.cpu_only
+def test_mutant_double_fold_rejected_loudly() -> None:
+    """A plan with a sink plus a merge with a sink must FAIL (defect 11).
+
+    The producing ``sparse_mla`` binding exposes ``sink_folded``; feeding it as
+    ``partials_sink_folded=`` to a merge that also folds the sink must raise —
+    the double-fold mutant (silently accepting both) is killed here.
+    """
+    world, batch, heads, head_dim = 2, 2, 4, 8
+    out = torch.randn(world, batch, heads, head_dim)
+    lses = torch.randn(world, batch, heads)
+    sink = torch.zeros(heads)
+
+    # The composition: a sparse_mla plan with a sink (binding.sink_folded=True)
+    # feeding a merge with a sink.
+    binding_sink_folded = True  # plan(has_attention_sink=True) with sink bound
+    with pytest.raises(ValueError, match="double sink fold"):
+        lse_reduce_scatter_reference(
+            out,
+            lses,
+            0,
+            lse_base="natural",
+            attention_sink=sink,
+            partials_sink_folded=binding_sink_folded,
+        )
+    with pytest.raises(ValueError, match="double sink fold"):
+        apply_attention_sink_after_merge(
+            out[0].clone(),
+            lses[0],
+            sink,
+            lse_base="natural",
+            partials_sink_folded=True,
+        )
+    # Provenance must be DECLARED when the merge folds the sink.
+    with pytest.raises(ValueError, match="declare partials_sink_folded"):
+        lse_reduce_scatter_reference(
+            out, lses, 0, lse_base="natural", attention_sink=sink
+        )
+    with pytest.raises(ValueError, match="declare partials_sink_folded"):
+        apply_attention_sink_after_merge(out[0].clone(), lses[0], sink, lse_base="natural")
+    # And a plan with a sink handed to a merge WITHOUT a sink fold is the
+    # supported CP shape: pass it through unchanged (the flag still guards).
+    merged = lse_reduce_scatter_reference(
+        out, lses, 0, lse_base="natural", partials_sink_folded=False
+    )
+    assert merged.shape == (batch, heads // world, head_dim)
+
+
+# ───────────────── defect 12: the LSE base is explicit, enforced ────────────
+
+
+@pytest.mark.cpu_only
+def test_lse_base_must_be_stated_explicitly() -> None:
+    """Nothing defaults: omitting the base raises (defect 12)."""
+    out = torch.zeros(2, 1, 2, 4)
+    lses = torch.zeros(2, 1, 2)
+    with pytest.raises(ValueError, match="must be stated explicitly"):
+        lse_reduce_scatter_reference(out, lses, 0)
+    with pytest.raises(ValueError, match="must be stated explicitly"):
+        apply_attention_sink_after_merge(
+            out[0], lses[0], torch.zeros(2), partials_sink_folded=False
+        )
+    with pytest.raises(ValueError, match="only one of"):
+        lse_reduce_scatter_reference(
+            out, lses, 0, lse_base="natural", is_lse_base_on_e=True
+        )
+    with pytest.raises(ValueError, match="lse_base must be one of"):
+        lse_reduce_scatter_reference(out, lses, 0, lse_base="e")
+    # The legacy boolean alias is explicit input and still resolves.
+    merged = lse_reduce_scatter_reference(out, lses, 0, is_lse_base_on_e=True)
+    assert merged.shape == (1, 1, 4)
+
+
+@pytest.mark.cpu_only
+def test_mutant_base_mismatch_dies() -> None:
+    """The wrong base re-weights the merge: it must NOT match truth (defect 12).
+
+    Base-2 partial LSEs merged as base-2 match the softmax ground truth; the
+    same partials merged as natural logs (the historical silent default) must
+    not.  Kills the base-mismatch mutant on both the merge and the fold.
+    """
+    heads = 8
+    stacked_out, stacked_lse, sink, out_gt, lse_gt = _shard_attention_case(
+        world=2,
+        batch=2,
+        heads=heads,
+        head_dim=8,
+        shard_sizes=_SHARD_SIZES[:2],
+        seed=77,
+    )
+    stacked_lse2 = stacked_lse / LN2  # base-2 partials
+    for rank in range(2):
+        head_slice = slice(rank * (heads // 2), (rank + 1) * (heads // 2))
+        good, good_lse = lse_reduce_scatter_reference(
+            stacked_out.float(),
+            stacked_lse2.float(),
+            rank,
+            lse_base="base2",
+            attention_sink=sink.float(),
+            partials_sink_folded=False,
+            return_lse=True,
+        )
+        torch.testing.assert_close(
+            good.double(), out_gt[:, head_slice], rtol=2e-5, atol=1e-5
+        )
+        torch.testing.assert_close(
+            good_lse.double(), lse_gt[:, head_slice] / LN2, rtol=2e-5, atol=1e-5
+        )
+        # Mismatched base: must NOT match the ground truth.
+        bad = lse_reduce_scatter_reference(
+            stacked_out.float(),
+            stacked_lse2.float(),
+            rank,
+            lse_base="natural",  # the mismatch mutant
+        )
+        assert not torch.allclose(
+            bad.double(), out_gt[:, head_slice], rtol=1e-3, atol=1e-4
+        ), f"rank {rank}: a base-mismatched merge matches ground truth"
+
+        # Fold: the base-2 form folded as base-2 must equal the natural-base
+        # fold of the same LSE; the mismatched base must not.
+        lse_e = torch.linspace(-3.0, 7.0, 2 * heads).reshape(2, heads) + 1.0
+        out_e = torch.randn(2, heads, 8)
+        ref_out, ref_lse = apply_attention_sink_after_merge(
+            out_e.clone(),
+            lse_e.float(),
+            sink.float(),
+            lse_base="natural",
+            partials_sink_folded=False,
+        )
+        good_out, good_lse = apply_attention_sink_after_merge(
+            out_e.clone(),
+            (lse_e / LN2).float(),
+            sink.float(),
+            lse_base="base2",
+            partials_sink_folded=False,
+        )
+        torch.testing.assert_close(good_out.double(), ref_out.double())
+        torch.testing.assert_close(
+            good_lse.double() * LN2, ref_lse.double(), rtol=1e-6, atol=1e-6
+        )
+        bad_out, bad_lse = apply_attention_sink_after_merge(
+            out_e.clone(),
+            (lse_e / LN2).float(),
+            sink.float(),
+            lse_base="natural",  # the mismatch mutant
+            partials_sink_folded=False,
+        )
+        assert not torch.allclose(
+            bad_lse.double() * LN2, ref_lse.double(), rtol=1e-3, atol=1e-3
+        ), "a base-mismatched fold matches the correct-base fold"
+        assert not torch.allclose(
+            bad_out.double(), ref_out.double(), rtol=1e-3, atol=1e-3
+        ), "a base-mismatched fold output matches the correct-base fold"
+
+
+# ──────── defect 14: realistic sinks (<= 3.2) vs comparable LSE ─────────────
+
+
+@pytest.mark.cpu_only
+def test_realistic_sink_regime_16_heads_matches_softmax_column() -> None:
+    """Sinks <= 3.2 against a comparable row LSE, 16-head groups (defect 14).
+
+    Hy4's trained sink logits are small (<= 3.2) and the top-k row LSE is of
+    the same order once the score scale is realistic; the fold must still be
+    visible (every factor strictly inside (0.05, 0.95)) and must match a real
+    softmax with a sink column — not the sigmoid/logaddexp formula — at
+    tolerances scaled to the output magnitude.
+    """
+    torch.manual_seed(20261114)
+    world, batch, heads, head_dim = 2, 3, 16, 8
+    assert heads % world == 0
+    # Realistic sinks: small positive learned logits, <= 3.2.
+    sink = torch.linspace(0.5, 3.2, heads, dtype=torch.float64)
+    q = torch.randn(batch, heads, head_dim, dtype=torch.float64)
+    all_scores, all_values, partials_out, partials_lse = [], [], [], []
+    for shard in (24, 32):
+        k = torch.randn(shard, heads, head_dim, dtype=torch.float64) / math.sqrt(
+            head_dim
+        )
+        v = torch.randn(shard, heads, head_dim, dtype=torch.float64)
+        # Score scale chosen so the shard LSE lands near the sink band
+        # (~2-3.5 nats) — the COMPARABLE regime where the fold is real work.
+        scores = torch.einsum("bhd,shd->bhs", q, k) * 0.35 - 1.0
+        all_scores.append(scores)
+        all_values.append(v)
+        lse_r = torch.logsumexp(scores, dim=-1)
+        probs = torch.exp(scores - lse_r.unsqueeze(-1))
+        partials_out.append(torch.einsum("bhs,shd->bhd", probs, v))
+        partials_lse.append(lse_r)
+    stacked_out = torch.stack(partials_out)
+    stacked_lse = torch.stack(partials_lse)
+
+    # Ground truth: one softmax over the union of the shards' logits PLUS one
+    # sink column per head — a real softmax, not the fold formula.
+    full_scores = torch.cat(all_scores, dim=-1)
+    full_values = torch.cat(all_values, dim=0)
+    total = torch.cat(
+        [full_scores, sink.view(1, heads, 1).expand(batch, heads, 1)], dim=-1
+    )
+    lse_gt = torch.logsumexp(total, dim=-1)
+    probs_gt = torch.exp(full_scores - lse_gt.unsqueeze(-1))
+    out_gt = torch.einsum("bhs,shd->bhd", probs_gt, full_values)
+
+    # Visibility precondition: the fold must be real work in this regime.
+    nosink_lse = torch.logsumexp(full_scores, dim=-1)
+    factor = torch.sigmoid(nosink_lse - sink.view(1, heads))
+    assert bool(((factor > 0.05) & (factor < 0.95)).all().item()), (
+        f"realistic-sink regime is degenerate: factors {factor.flatten()[:8]}"
+    )
+    assert float(sink.max()) <= 3.2
+
+    for rank in range(world):
+        merged, merged_lse = lse_reduce_scatter_reference(
+            stacked_out.float(),
+            stacked_lse.float(),
+            rank,
+            lse_base="natural",
+            attention_sink=sink.float(),
+            partials_sink_folded=False,
+            return_lse=True,
+        )
+        head_slice = slice(rank * (heads // world), (rank + 1) * (heads // world))
+        # Tolerances scaled to the OUTPUT MAGNITUDE (the old flat tolerances
+        # were ten times the output scale and could not fail).
+        out_scale = float(out_gt[:, head_slice].abs().max())
+        lse_scale = max(float(lse_gt[:, head_slice].abs().max()), 1.0)
+        torch.testing.assert_close(
+            merged.double(),
+            out_gt[:, head_slice],
+            rtol=2e-5,
+            atol=5e-3 * out_scale,
+        )
+        torch.testing.assert_close(
+            merged_lse.double(),
+            lse_gt[:, head_slice],
+            rtol=2e-5,
+            atol=5e-3 * lse_scale,
+        )
 
 
 # ───────────────────────────── GPU: the real merge ───────────────────────────
@@ -299,6 +619,7 @@ def _sink_worker(rank: int, world_size: int, port: int) -> None:
         out=torch.empty(
             MAX_BATCH, channel.heads_per_rank, HEAD_DIM, dtype=torch.bfloat16, device=device
         ),
+        lse_base="natural",
     )
     session = PreparationSession(
         device=device,
@@ -355,7 +676,9 @@ def _sink_worker(rank: int, world_size: int, port: int) -> None:
                 torch.stack(stacked_out).float(),
                 torch.stack(stacked_lse).float(),
                 rank,
+                lse_base="natural",
                 attention_sink=sink_full.float(),
+                partials_sink_folded=False,
                 return_lse=True,
             )
             expected = expected.to(torch.bfloat16)
@@ -370,6 +693,7 @@ def _sink_worker(rank: int, world_size: int, port: int) -> None:
                 torch.stack(stacked_out).float(),
                 torch.stack(stacked_lse).float(),
                 rank,
+                lse_base="natural",
                 return_lse=True,
             )[1]
             head_slice = slice(
@@ -394,7 +718,9 @@ def _sink_worker(rank: int, world_size: int, port: int) -> None:
                 partial_output,
                 partial_lse,
                 plan=plan,
+                lse_base="natural",
                 attention_sink=sink_full,
+                partials_sink_folded=False,
                 return_lse=True,
             )
             torch.cuda.synchronize(device)
@@ -407,7 +733,9 @@ def _sink_worker(rank: int, world_size: int, port: int) -> None:
             )
 
             # (a) sink disabled: must NOT match the sunk ground truth.
-            off = channel.lse_reduce_scatter(partial_output, partial_lse, plan=plan)
+            off = channel.lse_reduce_scatter(
+                partial_output, partial_lse, plan=plan, lse_base="natural"
+            )
             torch.cuda.synchronize(device)
             assert not torch.allclose(
                 off.float(), expected.float(), rtol=0.02, atol=0.02
@@ -421,6 +749,8 @@ def _sink_worker(rank: int, world_size: int, port: int) -> None:
                     stacked_out[r].float().clone(),
                     stacked_lse[r].float(),
                     sink_full.float(),
+                    lse_base="natural",
+                    partials_sink_folded=False,
                 )
                 per_rank_out.append(out_r)
                 per_rank_lse.append(lse_r)
@@ -428,6 +758,7 @@ def _sink_worker(rank: int, world_size: int, port: int) -> None:
                 torch.stack(per_rank_out),
                 torch.stack(per_rank_lse),
                 rank,
+                lse_base="natural",
             ).to(torch.bfloat16)
             assert not torch.allclose(
                 mutated.float(), expected.float(), rtol=0.02, atol=0.02

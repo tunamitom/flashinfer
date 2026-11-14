@@ -25,6 +25,7 @@ from b12x.preparation import (
 )
 
 from ._tuning import PcieConfig, PcieQuery, TUNING
+from .pcie_dcp_a2a import resolve_lse_base
 
 _DCP_SURFACES = frozenset(
     {
@@ -276,12 +277,28 @@ class _DcpExecutionState:
         """Run a bound call without reentering preparation or compiler caches."""
         surface = self.query.surface
         if surface.endswith("lse_reduce_scatter"):
+            if "lse_base" in call:
+                lse_base, is_lse_base_on_e = call["lse_base"], None
+            elif "is_lse_base_on_e" in call:
+                lse_base, is_lse_base_on_e = None, call["is_lse_base_on_e"]
+            elif "natural_log" in call:
+                lse_base, is_lse_base_on_e = None, bool(call["natural_log"])
+            else:
+                raise ValueError(
+                    "DCP lse_reduce_scatter call metadata must state the LSE "
+                    "base explicitly (lse_base='base2' | 'natural'); nothing "
+                    "defaults"
+                )
             return self.runtime._lse_reduce_scatter_on_device(
                 call["partial_output"],
                 call["partial_lse"],
                 call.get("out"),
                 state=self,
-                is_lse_base_on_e=call.get("is_lse_base_on_e", True),
+                lse_base=resolve_lse_base(
+                    lse_base,
+                    is_lse_base_on_e,
+                    what="DcpAllToAll.lse_reduce_scatter",
+                ),
                 attention_sink=call.get("attention_sink"),
                 lse_out=call.get("lse_out"),
                 return_lse=call.get("return_lse", False),

@@ -565,8 +565,8 @@ def test_reference_selects_destination_heads_and_combines_lse_weights():
         ]
     )
 
-    rank0 = lse_reduce_scatter_reference(outputs, lses, 0)
-    rank1 = lse_reduce_scatter_reference(outputs, lses, 1)
+    rank0 = lse_reduce_scatter_reference(outputs, lses, 0, lse_base="natural")
+    rank1 = lse_reduce_scatter_reference(outputs, lses, 1, lse_base="natural")
 
     torch.testing.assert_close(rank0, torch.tensor([[[2.0], [2.0]]]))
     torch.testing.assert_close(rank1, torch.tensor([[[20.0], [0.0]]]))
@@ -582,7 +582,7 @@ def test_reference_ignores_nan_output_from_empty_shard():
     ).reshape(2, 1, 2, 1)
     lses = torch.tensor([[[-torch.inf, 0.0]], [[0.0, 0.0]]])
 
-    actual = lse_reduce_scatter_reference(outputs, lses, 0)
+    actual = lse_reduce_scatter_reference(outputs, lses, 0, lse_base="natural")
 
     torch.testing.assert_close(actual, torch.tensor([[[4.0]]]))
 

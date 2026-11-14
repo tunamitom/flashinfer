@@ -237,14 +237,84 @@ def _staging_layout(
     )
 
 
+LSE_BASES = ("base2", "natural")
+
+
+def resolve_lse_base(
+    lse_base: str | None,
+    is_lse_base_on_e: bool | None,
+    *,
+    what: str,
+) -> str:
+    """Resolve an EXPLICIT log base for an LSE-consuming entry point.
+
+    The base has no default: prefill/extend/verify sparse-MLA LSEs are
+    ``base2`` while ``lse_reduce_scatter`` historically defaulted to natural
+    logs, and silently guessing wrong re-weights the whole merge.  Pass
+    ``lse_base="base2" | "natural"`` (or the legacy ``is_lse_base_on_e``
+    boolean, exactly one of the two) on every call.
+    """
+    if lse_base is not None and is_lse_base_on_e is not None:
+        raise ValueError(f"{what}: pass only one of lse_base= and is_lse_base_on_e=")
+    if lse_base is None and is_lse_base_on_e is None:
+        raise ValueError(
+            f"{what}: the LSE base must be stated explicitly "
+            f"(lse_base='base2' | 'natural'); nothing defaults"
+        )
+    if lse_base is None:
+        lse_base = "natural" if is_lse_base_on_e else "base2"
+    if lse_base not in LSE_BASES:
+        raise ValueError(
+            f"{what}: lse_base must be one of {LSE_BASES}, got {lse_base!r}"
+        )
+    return lse_base
+
+
+def _require_single_fold(
+    *,
+    what: str,
+    partials_sink_folded: bool | None,
+    folding_now: bool,
+) -> None:
+    """Reject a second sink fold loudly (defect 11: double-fold).
+
+    A plan whose per-rank attention already folded the sink
+    (``sparse_mla`` bindings with ``attention_sink`` — ``Binding.sink_folded``)
+    plus a merge that folds it again over-attenuates the output by one phantom
+    sink row per rank.  When the merge folds the sink, the caller must state
+    the partials' provenance (``partials_sink_folded=``) and it must be False.
+    """
+    if not folding_now:
+        if partials_sink_folded:
+            raise ValueError(
+                f"{what}: partials_sink_folded=True but no merge fold was "
+                f"requested; pass the already-folded LSE through unchanged"
+            )
+        return
+    if partials_sink_folded is None:
+        raise ValueError(
+            f"{what}: declare partials_sink_folded= (the producing attention "
+            f"binding's sink_folded) when folding the sink after the merge"
+        )
+    if partials_sink_folded:
+        raise ValueError(
+            f"{what}: double sink fold — the per-rank attention plan already "
+            f"folded the sink and the merge folds it again; the sink must be "
+            f"folded EXACTLY ONCE (sparse_mla plan with a sink XOR a merge "
+            f"with a sink)"
+        )
+
+
 def lse_reduce_scatter_reference(
     partial_outputs: torch.Tensor,
     partial_lses: torch.Tensor,
     rank: int,
     *,
-    is_lse_base_on_e: bool = True,
+    lse_base: str | None = None,
+    is_lse_base_on_e: bool | None = None,
     attention_sink: torch.Tensor | None = None,
     return_lse: bool = False,
+    partials_sink_folded: bool | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Reference LSE-weighted reduction for stacked rank contributions.
 
@@ -252,18 +322,34 @@ def lse_reduce_scatter_reference(
         partial_outputs: Tensor shaped ``[world, batch, heads, head_dim]``.
         partial_lses: FP32 tensor shaped ``[world, batch, heads]``.
         rank: Destination rank whose contiguous head shard is returned.
-        is_lse_base_on_e: Whether LSE values use natural logarithms.
+        lse_base: EXPLICIT log base of ``partial_lses`` and of the returned
+            merged LSE: ``"base2"`` or ``"natural"`` (the legacy boolean
+            ``is_lse_base_on_e`` is accepted instead, exactly one of the two).
         attention_sink: Optional per-head natural-log sink logits, applied
             EXACTLY ONCE after the cross-rank merge (see
             :func:`apply_attention_sink_after_merge`). Accepts the local
             ``[heads // world]`` shard or the full ``[heads]`` vector.
         return_lse: Also return the merged (and folded) LSE for the shard.
+        partials_sink_folded: Whether the per-rank partials already carry the
+            sink fold (``sparse_mla.Binding.sink_folded``). Required when
+            ``attention_sink`` is set; True fails loudly (double fold).
 
     Returns:
         The reduced output shaped ``[batch, heads // world, head_dim]``, or
         ``(output, merged_lse)`` when ``return_lse`` is set. The merged LSE is
-        shaped ``[batch, heads // world]`` and uses the input's log base.
+        shaped ``[batch, heads // world]`` and uses the declared log base.
+
+    Empty rows (no rank contributed a finite LSE) return ``-inf`` LSE — never a
+    clamp floor — and a zero output; folding a sink into them yields the sink.
     """
+    lse_base = resolve_lse_base(
+        lse_base, is_lse_base_on_e, what="lse_reduce_scatter_reference"
+    )
+    _require_single_fold(
+        what="lse_reduce_scatter_reference",
+        partials_sink_folded=partials_sink_folded,
+        folding_now=attention_sink is not None,
+    )
     if partial_outputs.ndim != 4:
         raise ValueError("partial_outputs must have rank 4")
     if partial_lses.shape != partial_outputs.shape[:-1]:
@@ -283,21 +369,25 @@ def lse_reduce_scatter_reference(
     sanitized = torch.where(valid, lses, torch.full_like(lses, -torch.inf))
     max_lse = sanitized.amax(dim=0)
     max_lse = torch.where(torch.isfinite(max_lse), max_lse, 0.0)
-    if is_lse_base_on_e:
+    if lse_base == "natural":
         weights = torch.exp(sanitized - max_lse.unsqueeze(0))
     else:
         weights = torch.exp2(sanitized - max_lse.unsqueeze(0))
     weights = torch.where(valid, weights, torch.zeros_like(weights))
     weight_sum = weights.sum(dim=0)
-    weights /= weight_sum.clamp_min_(1e-10)
+    # Out-of-place clamp: an in-place clamp on weight_sum would turn an
+    # all-empty row's 0 into 1e-10 and report log(1e-10) = -23.03 instead of
+    # -inf (defect 10).  Valid rows carry weight_sum >= 1 (the max-weight
+    # entry normalises to 1), so the clamp only guards the division here.
+    weights = weights / weight_sum.clamp_min(1e-10)
     merged = (outputs * weights.unsqueeze(-1)).sum(dim=0).to(partial_outputs.dtype)
 
     if attention_sink is None and not return_lse:
         return merged
 
-    # Merged LSE in the input's log base: logsumexp over the world dimension
+    # Merged LSE in the declared log base: logsumexp over the world dimension
     # (-inf when no rank contributed a finite LSE).
-    if is_lse_base_on_e:
+    if lse_base == "natural":
         merged_lse = torch.where(
             weight_sum > 0,
             max_lse + torch.log(weight_sum.clamp_min(torch.finfo(torch.float32).tiny)),
@@ -318,7 +408,8 @@ def lse_reduce_scatter_reference(
             merged,
             merged_lse,
             sink,
-            is_lse_base_on_e=is_lse_base_on_e,
+            lse_base=lse_base,
+            partials_sink_folded=False,  # validated above
         )
     if return_lse:
         return merged, merged_lse
@@ -330,15 +421,19 @@ def apply_attention_sink_after_merge(
     merged_lse: torch.Tensor,
     attention_sink: torch.Tensor,
     *,
-    is_lse_base_on_e: bool = True,
+    lse_base: str | None = None,
+    is_lse_base_on_e: bool | None = None,
     fold_lse: bool = True,
+    partials_sink_folded: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Post-merge attention-sink step for context-parallel attention.
 
     Under context parallelism every rank folds its own context shard WITHOUT
     the sink; the sink is a single virtual logit per query head and must be
     folded EXACTLY ONCE after the cross-rank LSE reduction. Folding it per rank
-    would add one phantom sink row per rank and over-attenuate the output.
+    would add one phantom sink row per rank and over-attenuate the output
+    (defect 11: a plan with a sink plus a merge with a sink must fail loudly —
+    pass ``partials_sink_folded=`` and it must be False).
 
     This is numerically identical to the sparse-MLA decode epilogue
     (``_shared/mla/decode_math.py``)::
@@ -348,16 +443,28 @@ def apply_attention_sink_after_merge(
 
     Args:
         out: merged output ``[batch, heads, head_dim]`` (any float dtype).
-        merged_lse: post-merge LSE ``[batch, heads]`` (FP32), in the base given
-            by ``is_lse_base_on_e``.
+        merged_lse: post-merge LSE ``[batch, heads]`` (FP32), in the EXPLICIT
+            base given by ``lse_base`` (``"base2"`` | ``"natural"``; the legacy
+            boolean ``is_lse_base_on_e`` is accepted instead, exactly one).
         attention_sink: natural-log per-head sink logits. Accepts ``[heads]``
             or ``[1, heads]``.
-        is_lse_base_on_e: whether ``merged_lse`` uses natural logs.
         fold_lse: also fold the sink into the returned LSE (the decode
             epilogue does; disable only to keep the un-sunk LSE).
+        partials_sink_folded: whether the incoming LSE already carries the
+            sink fold (``sparse_mla.Binding.sink_folded``); required and must
+            be False — folding twice is rejected loudly.
 
-    Returns ``(out, lse)``; ``out`` is scaled in place and returned.
+    Returns ``(out, lse)``; ``out`` is scaled in place and returned. Empty
+    rows (``lse = -inf``) fold to a zero output and the sink LSE.
     """
+    lse_base = resolve_lse_base(
+        lse_base, is_lse_base_on_e, what="apply_attention_sink_after_merge"
+    )
+    _require_single_fold(
+        what="apply_attention_sink_after_merge",
+        partials_sink_folded=partials_sink_folded,
+        folding_now=True,
+    )
     if merged_lse.ndim != out.ndim - 1 or merged_lse.shape != out.shape[:-1]:
         raise ValueError("merged_lse must match out without the head_dim")
     sink = attention_sink.to(device=out.device, dtype=torch.float64).reshape(-1)
@@ -369,14 +476,14 @@ def apply_attention_sink_after_merge(
             f"got {tuple(attention_sink.shape)}"
         )
     lse_e = merged_lse.to(torch.float64)
-    if not is_lse_base_on_e:
+    if lse_base != "natural":
         lse_e = lse_e * math.log(2.0)
     factor = torch.sigmoid(lse_e - sink.unsqueeze(0))
     out_dtype = out.dtype
     out.mul_(factor.unsqueeze(-1).to(out_dtype))
     if fold_lse:
         lse_e = torch.logaddexp(lse_e, sink.unsqueeze(0))
-    folded = lse_e if is_lse_base_on_e else lse_e / math.log(2.0)
+    folded = lse_e if lse_base == "natural" else lse_e / math.log(2.0)
     return out, folded.to(torch.float32)
 
 
@@ -982,14 +1089,22 @@ class PCIeDCPA2A:
         out: Optional[torch.Tensor] = None,
         *,
         plan: Plan,
-        is_lse_base_on_e: bool = True,
+        lse_base: str | None = None,
+        is_lse_base_on_e: bool | None = None,
         attention_sink: torch.Tensor | None = None,
+        partials_sink_folded: bool | None = None,
         lse_out: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         threads: int | None = None,
         block_limit: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Merge per-rank attention partials, then apply the sink EXACTLY once.
+
+        ``lse_base`` (``"base2"`` | ``"natural"``, or the legacy boolean
+        ``is_lse_base_on_e``) MUST be stated explicitly: it is the log base of
+        ``partial_lse`` and of the returned merged LSE. Nothing defaults — the
+        sparse-MLA prefill/extend/verify LSE is ``base2`` while this merge
+        historically defaulted to natural logs.
 
         ``attention_sink`` (natural-log per-head logits; the local
         ``[heads_per_rank]`` shard or the full ``[total_heads]`` vector) is
@@ -998,12 +1113,23 @@ class PCIeDCPA2A:
         context parallelism each rank's partials must be computed WITHOUT the
         sink so the fold is applied exactly once for the whole merge; folding
         per rank would over-attenuate the output (one phantom sink row per
-        rank).
+        rank). When ``attention_sink`` is set the caller must declare
+        ``partials_sink_folded=`` (the producing ``sparse_mla`` binding's
+        ``sink_folded``) and it must be False — a plan with a sink plus a merge
+        with a sink is rejected loudly (defect 11).
 
         When ``attention_sink`` or ``return_lse`` is set, the merged LSE is
         written to ``lse_out`` (``[batch, heads_per_rank]`` FP32; allocated
         here if omitted — pass it explicitly under CUDA-graph capture).
         """
+        lse_base = resolve_lse_base(
+            lse_base, is_lse_base_on_e, what="PCIeDCPA2A.lse_reduce_scatter"
+        )
+        _require_single_fold(
+            what="PCIeDCPA2A.lse_reduce_scatter",
+            partials_sink_folded=partials_sink_folded,
+            folding_now=attention_sink is not None,
+        )
         with _device_guard(self.device):
             state = self._prepared_state(plan)
             return self._lse_reduce_scatter_on_device(
@@ -1011,8 +1137,9 @@ class PCIeDCPA2A:
                 partial_lse,
                 out,
                 state=state,
-                is_lse_base_on_e=is_lse_base_on_e,
+                lse_base=lse_base,
                 attention_sink=attention_sink,
+                partials_sink_folded=partials_sink_folded,
                 lse_out=lse_out,
                 return_lse=return_lse,
                 threads=threads,
@@ -1026,13 +1153,19 @@ class PCIeDCPA2A:
         out: Optional[torch.Tensor],
         *,
         state,
-        is_lse_base_on_e: bool,
+        lse_base: str,
         attention_sink: Optional[torch.Tensor] = None,
+        partials_sink_folded: Optional[bool] = None,
         lse_out: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         threads: int,
         block_limit: int,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        _require_single_fold(
+            what="PCIeDCPA2A._lse_reduce_scatter_on_device",
+            partials_sink_folded=partials_sink_folded,
+            folding_now=attention_sink is not None,
+        )
         self._check_stream()
         if out is None:
             out = torch.empty(
@@ -1103,7 +1236,7 @@ class PCIeDCPA2A:
             out,
             lse_out=lse_out,
             slot=slot,
-            natural_log=bool(is_lse_base_on_e),
+            natural_log=bool(lse_base == "natural"),
             threads=threads,
             blocks=blocks,
             device_slot_selection=self._device_slot_selection,
@@ -1119,7 +1252,8 @@ class PCIeDCPA2A:
                 out,
                 lse_out,
                 sink,
-                is_lse_base_on_e=bool(is_lse_base_on_e),
+                lse_base=lse_base,
+                partials_sink_folded=False,  # validated at the public entry
             )
             lse_out.copy_(folded_lse)
         if return_lse:
@@ -2267,8 +2401,10 @@ class PCIeDCPA2APool:
         out=None,
         *,
         plan: Plan,
-        is_lse_base_on_e=True,
+        lse_base=None,
+        is_lse_base_on_e=None,
         attention_sink=None,
+        partials_sink_folded=None,
         lse_out=None,
         return_lse=False,
         threads=None,
@@ -2286,8 +2422,10 @@ class PCIeDCPA2APool:
                         partial_lse,
                         out,
                         plan=plan,
+                        lse_base=lse_base,
                         is_lse_base_on_e=is_lse_base_on_e,
                         attention_sink=attention_sink,
+                        partials_sink_folded=partials_sink_folded,
                         lse_out=lse_out,
                         return_lse=return_lse,
                         threads=threads,
@@ -2298,8 +2436,10 @@ class PCIeDCPA2APool:
                 partial_lse,
                 out,
                 plan=plan,
+                lse_base=lse_base,
                 is_lse_base_on_e=is_lse_base_on_e,
                 attention_sink=attention_sink,
+                partials_sink_folded=partials_sink_folded,
                 lse_out=lse_out,
                 return_lse=return_lse,
                 threads=threads,

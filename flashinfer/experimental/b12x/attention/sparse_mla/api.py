@@ -43,12 +43,31 @@ from . import META
 
 @dataclass(frozen=True, kw_only=True)
 class Binding:
-    """A complete sparse-MLA invocation bound to one immutable plan."""
+    """A complete sparse-MLA invocation bound to one immutable plan.
+
+    ``sink_folded`` and ``lse_base`` carry the fold/base provenance a
+    context-parallel consumer needs: under CP every rank folds its shard
+    WITHOUT the sink and the cross-rank merge folds it exactly once, so a
+    merge consuming this binding's LSE must be given
+    ``partials_sink_folded=binding.sink_folded`` (a plan with a sink plus a
+    merge with a sink fails loudly) and ``lse_base=binding.lse_base`` (the
+    merge no longer defaults to natural logs).
+    """
 
     plan: Plan
     runtime: _RuntimeBinding
     kv_cache: torch.Tensor
     attention_sink: torch.Tensor | None = None
+
+    @property
+    def sink_folded(self) -> bool:
+        """True when this binding's LSE already carries the sink fold."""
+        return self.attention_sink is not None
+
+    @property
+    def lse_base(self) -> str:
+        """Log base of the LSE returned by :func:`run` (``"base2"`` | ``"natural"``)."""
+        return _state(self.plan, device=self.kv_cache.device).caps.lse_scale
 
 
 def plan(
@@ -126,6 +145,12 @@ def run(binding: Binding) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
     Decode returns output, or (output, LSE) when return_lse is enabled.
     Extend modes return (output, LSE). Both tensors alias planned scratch.
+
+    LSE base contract (enforced at this boundary, defect 12): the returned LSE
+    is in ``binding.lse_base`` — ``Caps.lse_scale`` — for every mode, including
+    prefill/extend/verify whose kernel natively emits base-2.  Feed it to the
+    CP merge as ``lse_base=binding.lse_base``; the merge APIs require the base
+    explicitly and never default to natural logs.
     """
 
     if not isinstance(binding, Binding):

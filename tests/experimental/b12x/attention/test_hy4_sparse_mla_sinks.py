@@ -105,6 +105,8 @@ def _run_public(
     mode: str,
     sink: torch.Tensor | None,
     width: int = TOPK,
+    lse_scale: str = "base2",
+    want_binding: bool = False,
 ):
     rows, heads, _ = q_all.shape
     sm_scale = HEAD_DIM**-0.5
@@ -121,7 +123,7 @@ def _run_public(
         page_size=PAGE_SIZE,
         mode=mode,
         return_lse=True,
-        lse_scale="base2",
+        lse_scale=lse_scale,
     )
     declaration = sparse_mla.plan(
         sparse_mla.Caps(
@@ -168,6 +170,8 @@ def _run_public(
             attention_sink=sink,
         )
         out, lse = sparse_mla.run(binding)
+    if want_binding:
+        return out, lse, binding
     return out, lse
 
 
@@ -362,3 +366,112 @@ def test_sink_presence_contract_enforced() -> None:
                     selected_lengths=active,
                     attention_sink=None,
                 )
+
+
+# ───────────────── defect 12: LSE base enforced at the boundary ─────────────
+
+
+@pytest.mark.parametrize("mode", ["decode", "extend", "verify"])
+def test_lse_base_contract_enforced_at_boundary(mode: str) -> None:
+    """The returned LSE is in the DECLARED base for every mode (defect 12).
+
+    Prefill/extend/verify kernels natively emit base-2; the bug (the mutant)
+    returned base-2 whatever ``lse_scale`` said while the CP merge assumed
+    natural logs.  A natural declaration must now return natural logs and a
+    base2 declaration base-2 logs — never the other one.
+    """
+    require_b12x()
+    rows, heads = 2, 8
+    q, kv, sel, lens, active = _make_case(rows=rows, heads=heads)
+    ref_out, ref_lse2 = sparse_mla_reference(
+        q_all=q,
+        kv_cache=kv,
+        page_table_1=sel,
+        active_token_counts=active,
+        sm_scale=HEAD_DIM**-0.5,
+        v_head_dim=V_HEAD_DIM,
+        return_lse=True,
+    )
+    live = ref_lse2.isfinite()
+
+    # base2 declaration: exactly the kernel's base-2 LSE.
+    out2, lse2, b2 = _run_public(
+        q, kv, sel, lens, active,
+        mode=mode, sink=None, lse_scale="base2", want_binding=True,
+    )
+    assert b2.lse_base == "base2"
+    _assert_lse_close(lse2, ref_lse2, what=f"{mode}-declared-base2")
+    assert not torch.allclose(
+        lse2[live].float(), (ref_lse2[live] * LN2).float(), atol=0.5, rtol=0.0
+    ), f"{mode}: base2 declaration returned natural logs"
+
+    # natural declaration: the boundary must convert (the mutant returns base-2).
+    outn, lsen, bn = _run_public(
+        q, kv, sel, lens, active,
+        mode=mode, sink=None, lse_scale="natural", want_binding=True,
+    )
+    assert bn.lse_base == "natural"
+    torch.testing.assert_close(
+        lsen[live].float(),
+        (ref_lse2[live] * LN2).float(),
+        rtol=0.0,
+        atol=0.08,
+        msg=lambda m: f"{mode}-declared-natural: {m}",
+    )
+    assert not torch.allclose(
+        lsen[live].float(), ref_lse2[live].float(), atol=0.5, rtol=0.0
+    ), f"{mode}: lse_scale='natural' returned base-2 LSE (defect-12 mutant)"
+
+
+def test_cp_provenance_rejects_plan_sink_plus_merge_sink() -> None:
+    """A plan with a sink plus a merge with a sink must fail loudly (defect 11).
+
+    The binding carries the fold provenance (``sink_folded``) and the log base
+    (``lse_base``); a CP merge composed from them must reject the double fold
+    and accept the supported single-fold shape.
+    """
+    require_b12x()
+    from b12x.comm.pcie.pcie_dcp_a2a import lse_reduce_scatter_reference
+
+    rows, heads = 1, 8
+    q, kv, sel, lens, active = _make_case(rows=rows, heads=heads)
+    sink = _sink_logits(heads, seed=3)
+
+    # Plan WITH a sink: its LSE already carries the fold.
+    _, _, bound = _run_public(
+        q, kv, sel, lens, active,
+        mode="decode", sink=sink, want_binding=True,
+    )
+    assert bound.sink_folded is True
+    assert bound.lse_base == "base2"
+
+    world_out = torch.zeros(2, 2, heads, 8)
+    world_lse = torch.zeros(2, 2, heads)
+    with pytest.raises(ValueError, match="double sink fold"):
+        lse_reduce_scatter_reference(
+            world_out,
+            world_lse,
+            0,
+            lse_base=bound.lse_base,
+            attention_sink=sink.cpu(),
+            partials_sink_folded=bound.sink_folded,
+            return_lse=True,
+        )
+
+    # Plan WITHOUT a sink: the merge is the single fold site and must work.
+    _, _, plain = _run_public(
+        q, kv, sel, lens, active,
+        mode="decode", sink=None, want_binding=True,
+    )
+    assert plain.sink_folded is False
+    merged, merged_lse = lse_reduce_scatter_reference(
+        world_out,
+        world_lse,
+        0,
+        lse_base=plain.lse_base,
+        attention_sink=sink.cpu(),
+        partials_sink_folded=plain.sink_folded,
+        return_lse=True,
+    )
+    assert merged.shape == (2, heads // 2, 8)
+    assert merged_lse.shape == (2, heads // 2)
