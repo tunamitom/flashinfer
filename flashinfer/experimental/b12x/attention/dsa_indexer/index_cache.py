@@ -16,6 +16,12 @@ layers 2-4 consume layer 1's ``selected`` buffer.  ``hy4_indexer_layers()``
 builds the full 78-layer map with the same rule — a shared layer binds the
 previous full layer's buffer.
 
+Under context parallelism the merged cross-rank top-k lands in the owner's
+``selected`` buffer in GLOBAL positions; :meth:`IndexCache.handback` recovers
+the per-rank selection (``dsa_indexer.selection_handback``) into the owner's
+``selected``/``counts`` buffers — once per group, live for every shared layer
+that binds them (consult2 defect 15b).
+
 Mutants that must die here (hy4-plan §1.5): stale or recomputed selection in
 a shared layer.  A shared layer must read the live full-layer buffer, never
 its own copy and never an earlier snapshot.
@@ -97,12 +103,14 @@ class IndexCache:
     """Allocates and shares per-layer selection buffers and index-key pages.
 
     Full layers own an ``[max_q_rows, topk]`` int32 ``selected`` buffer
-    (initialised to ``-1`` — no selection) and ``index_pages_per_layer``
-    paged FP8 index-key pages.  Shared layers alias their owner's ``selected``
-    buffer (same ``data_ptr``) and allocate nothing.  ``selected`` buffers are
-    the tensors passed straight to ``sparse_mla.bind(selected_indices=...)``;
-    ``indexer_output`` is the ``output_indices`` operand of
-    ``dsa_indexer.bind`` (full layers only, physical slot space).
+    (initialised to ``-1`` — no selection), an ``[max_q_rows]`` int32
+    ``counts`` buffer (the handed-back selection's per-row live counts) and
+    ``index_pages_per_layer`` paged FP8 index-key pages.  Shared layers alias
+    their owner's ``selected``/``counts`` buffers (same ``data_ptr``) and
+    allocate nothing.  ``selected`` buffers are the tensors passed straight to
+    ``sparse_mla.bind(selected_indices=...)`` (``counts`` to
+    ``selected_lengths=...``); ``indexer_output`` is the ``output_indices``
+    operand of ``dsa_indexer.bind`` (full layers only, physical slot space).
     """
 
     def __init__(
@@ -151,12 +159,19 @@ class IndexCache:
         self._page_bytes = self._page_size * (INDEX_HEAD_DIM + _SCALE_BYTES)
 
         self._selected: dict[int, torch.Tensor] = {}
+        self._counts: dict[int, torch.Tensor] = {}
+        self._handback_scratch: dict[int, torch.Tensor] = {}
         self._pages: dict[int, torch.Tensor] = {}
         for layer in layers:
             if layer.kind == "full":
                 self._selected[layer.layer_id] = torch.full(
                     (self._max_q_rows, self._topk),
                     -1,
+                    dtype=torch.int32,
+                    device=self._device,
+                )
+                self._counts[layer.layer_id] = torch.zeros(
+                    (self._max_q_rows,),
                     dtype=torch.int32,
                     device=self._device,
                 )
@@ -206,6 +221,16 @@ class IndexCache:
         layer = self.layer(layer_id)
         return self._selected[layer.owner_id]
 
+    def counts(self, layer_id: int) -> torch.Tensor:
+        """The layer's per-row live counts for ``sparse_mla.bind``.
+
+        The counts of the handed-back per-rank selection (``selected_lengths``);
+        shared layers return the owner full layer's buffer object — the same
+        ``data_ptr`` as ``selected`` resolves.
+        """
+        layer = self.layer(layer_id)
+        return self._counts[layer.owner_id]
+
     def indexer_output(self, layer_id: int) -> torch.Tensor:
         """The ``output_indices`` operand for ``dsa_indexer.bind`` (full only).
 
@@ -238,6 +263,63 @@ class IndexCache:
         if overlap:
             raise ValueError(f"caps fields owned by the IndexCache: {sorted(overlap)}")
         return Caps(**forced, **caps_kwargs)
+
+    def handback(
+        self,
+        layer_id: int,
+        merged: torch.Tensor,
+        *,
+        world_size: int,
+        rank: int,
+        slot_map: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Recover the per-rank selection from the merged cross-rank top-k.
+
+        Consult2 defect 15b.  ``merged`` is the group's merged global top-k
+        ``[rows, topk]`` (the CP index merge's ``output_indices``); the
+        hand-back writes this rank's compacted local selection and live counts
+        into the OWNER full layer's ``selected``/``counts`` buffers — the
+        buffers every shared layer of the group binds (``selected()``/
+        ``counts()`` resolve to them by ``data_ptr``).  Accepts any layer id
+        of the group: layer 1 and its 57-odd shared layers all reach layer 1's
+        buffers, so the hand-back runs once per group and stays live.
+
+        Returns the owner's ``(selected, counts)``.
+        """
+        from .selection_handback import selection_handback_reference
+
+        layer = self.layer(layer_id)
+        owner = layer.owner_id
+        if merged.ndim != 2:
+            raise ValueError(f"merged must be rank-2, got {tuple(merged.shape)}")
+        if merged.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"merged must be int32/int64, got {merged.dtype}")
+        if merged.device != self._selected[owner].device:
+            raise ValueError("merged must be on the IndexCache device")
+        rows = int(merged.shape[0])
+        if int(merged.shape[1]) != self._topk or rows > self._max_q_rows:
+            raise ValueError(
+                f"merged must be at most {(self._max_q_rows, self._topk)}, "
+                f"got {tuple(merged.shape)}"
+            )
+        scratch = self._handback_scratch.get(owner)
+        if scratch is None:
+            scratch = torch.empty(
+                (self._max_q_rows, self._topk + 1),
+                dtype=torch.int32,
+                device=self._device,
+            )
+            self._handback_scratch[owner] = scratch
+        selection_handback_reference(
+            merged,
+            world_size=world_size,
+            rank=rank,
+            scratch=scratch[:rows],
+            output=self._selected[owner][:rows],
+            counts=self._counts[owner][:rows],
+            slot_map=slot_map,
+        )
+        return self._selected[owner], self._counts[owner]
 
     # ──────────────────────────── accounting ───────────────────────────────
 
