@@ -1051,7 +1051,10 @@ class PCIeDCPA2A:
             if int(sink.numel()) == self.total_heads and (
                 self.total_heads != self.heads_per_rank
             ):
-                sink = sink[self.rank * self.heads_per_rank :].contiguous()
+                sink = sink[
+                    self.rank * self.heads_per_rank : (self.rank + 1)
+                    * self.heads_per_rank
+                ].contiguous()
             if sink.shape != (self.heads_per_rank,):
                 raise ValueError(
                     "attention_sink must cover the local head shard "
@@ -1108,13 +1111,17 @@ class PCIeDCPA2A:
         )
         if sink is not None:
             # Post-merge sink step, applied exactly once for the whole merge.
+            # ``apply_attention_sink_after_merge`` scales ``out`` in place and
+            # RETURNS the folded LSE; write it back so the caller's ``lse_out``
+            # (the graph-capture operand) carries ``logaddexp(lse, sink)``.
             assert lse_out is not None
-            apply_attention_sink_after_merge(
+            _, folded_lse = apply_attention_sink_after_merge(
                 out,
                 lse_out,
                 sink,
                 is_lse_base_on_e=bool(is_lse_base_on_e),
             )
+            lse_out.copy_(folded_lse)
         if return_lse:
             return out, lse_out
         return out

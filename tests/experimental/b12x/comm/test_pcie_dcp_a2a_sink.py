@@ -330,8 +330,11 @@ def _sink_worker(rank: int, world_size: int, port: int) -> None:
 
         torch.manual_seed(31337 + rank)
         # A learned per-head sink vector shared by every rank; each rank folds
-        # only its local shard's slice after the merge.
-        sink_full = torch.linspace(2.0, 8.0, TOTAL_HEADS, device=device)
+        # only its local shard's slice after the merge.  Sink band 6..10: at
+        # top-k 2048 the row LSE is ~7.6 nats, so O(1) sinks are invisible and
+        # the mutant checks below could not discriminate (see the factor-
+        # visibility precondition at each step).
+        sink_full = torch.linspace(6.0, 10.0, TOTAL_HEADS, device=device)
 
         for step, batch in enumerate((1, 4, MAX_BATCH), start=1):
             partial_output = torch.empty(
@@ -356,6 +359,36 @@ def _sink_worker(rank: int, world_size: int, port: int) -> None:
                 return_lse=True,
             )
             expected = expected.to(torch.bfloat16)
+
+            # Factor-visibility precondition: the sink-on and sink-off merges
+            # (and the per-rank-fold mutant) can only be told apart where the
+            # fold factor sigmoid(lse - sink) is visibly below 1.  With sinks
+            # in 6..10 and the merged shard LSE near 6-7 nats this holds on
+            # essentially every entry; fail loudly if a change re-introduces
+            # invisible O(1) sinks.
+            nosink_lse = lse_reduce_scatter_reference(
+                torch.stack(stacked_out).float(),
+                torch.stack(stacked_lse).float(),
+                rank,
+                return_lse=True,
+            )[1]
+            head_slice = slice(
+                rank * (TOTAL_HEADS // world_size),
+                (rank + 1) * (TOTAL_HEADS // world_size),
+            )
+            factor = torch.sigmoid(
+                nosink_lse.double()
+                - sink_full.float()[head_slice].double().unsqueeze(0)
+            )
+            visibility = 1.0 - factor
+            assert float(visibility.max().item()) > 0.3, (
+                f"step {step}: sink fold factor is everywhere ~1 "
+                f"(max invisibility {float(visibility.max().item()):.4f})"
+            )
+            assert float((visibility > 5e-2).to(torch.float32).mean().item()) > 0.9, (
+                f"step {step}: sink fold is invisible on most rows; "
+                "sinks must sit near the row LSE"
+            )
 
             actual, actual_lse = channel.lse_reduce_scatter(
                 partial_output,
