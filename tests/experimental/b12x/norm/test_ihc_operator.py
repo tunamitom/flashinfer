@@ -3,8 +3,11 @@
 Primary geometry is Hy4's: hidden 6144, ``fn`` FP32 ``[8, 4*6144]`` (the iHC
 8-row layout), 4 streams, ``magnitude=2.0``, ``hc_eps=1e-6``, ``norm_eps=1e-5``.
 The other whitelisted hidden sizes (4096/5120/7168, the mHC family) are covered
-as spot checks. Tolerances are stated in ``ihc_tolerances``; the mutant-kill
-tests use the same gates.
+as spot checks. Tolerances are stated in ``_ihc_tolerances``; the mutant-kill
+tests use the same gates. The fused ``run_post_pre`` boundary is compared both
+against the reference and against the exact three-launch pipeline it replaces,
+and the int64 token-offset contract is exercised above the ~87k-row int32
+overflow at hidden 6144.
 """
 
 import pytest
@@ -13,7 +16,7 @@ import torch
 from b12x.norm.mhc import _ihc_torch_ref as ref
 from b12x.norm.mhc import ihc
 
-from ihc_tolerances import assert_close_bf16, assert_close_pair, assert_close_post
+from ._ihc_tolerances import assert_close_bf16, assert_close_pair, assert_close_post
 
 HC = ihc.IHC_MULT  # 4
 MIXES = ihc.IHC_MIXES  # 8
@@ -23,7 +26,6 @@ NORM_EPS = 1.0e-5
 
 if not torch.cuda.is_available():
     pytest.skip("iHC operator tests require CUDA", allow_module_level=True)
-
 
 def _make_inputs(*, tokens: int, hidden: int, seed: int = 0, outer=()):
     gen = torch.Generator().manual_seed(seed)
@@ -45,6 +47,13 @@ def _make_branch(*, tokens: int, hidden: int, seed: int, outer=()):
     return (
         torch.randn(shape, generator=gen, dtype=torch.float32).cuda() / 4
     ).to(torch.bfloat16).contiguous()
+
+
+def _make_norm_weight(*, hidden: int, seed: int):
+    gen = torch.Generator().manual_seed(seed)
+    return (
+        torch.randn((hidden,), generator=gen, dtype=torch.float32).cuda() / 2
+    ).contiguous()
 
 
 # (tokens, hidden): hidden 6144 at decode-ish, chunked and prefill-ish token
@@ -108,6 +117,93 @@ def test_head_matches_reference(tokens: int, hidden: int) -> None:
     assert_close_bf16(got, want)
 
 
+@pytest.mark.parametrize(("tokens", "hidden"), _PARITY_CASES)
+def test_post_pre_matches_reference(tokens: int, hidden: int) -> None:
+    """The fused sublayer boundary against the reference, stage by stage.
+
+    The update stage is compared against ``ihc_post_reference``; the gate stage
+    against ``ihc_pre_reference`` on the BF16-rounded updated streams (the same
+    boundary values the three-launch pipeline sees). Comparing the composite to
+    the composite reference would carry the update stage's BF16
+    rounding-boundary flips into the 4H-term gate dots, which amplify them past
+    the FP32 gate; ``test_post_pre_is_the_three_launch_pipeline`` pins the
+    fusion itself, and this test pins "exactly one BF16 rounding" at each
+    stage (a fused kernel that gated on unrounded FP32 updates fails here).
+    """
+    streams, fn, hc_scale, hc_base = _make_inputs(
+        tokens=tokens, hidden=hidden, seed=tokens * 17 + hidden
+    )
+    branch = _make_branch(tokens=tokens, hidden=hidden, seed=tokens * 3 + hidden)
+    prev_post, _ = ihc.run_pre(streams, fn, hc_scale, hc_base)
+    got_out, got_post, got_y = ihc.run_post_pre(
+        branch, streams, prev_post, fn, hc_scale, hc_base
+    )
+    want_out = ref.ihc_post_reference(branch, streams, prev_post)
+    assert got_out.shape == streams.shape
+    assert got_post.shape == (tokens, HC) and got_y.shape == (tokens, hidden)
+    assert_close_bf16(got_out, want_out)
+    want_post, want_y = ref.ihc_pre_reference(
+        got_out,
+        fn,
+        hc_scale,
+        hc_base,
+        magnitude=MAGNITUDE,
+        hc_eps=HC_EPS,
+        norm_eps=NORM_EPS,
+    )
+    assert_close_post(got_post, want_post)
+    assert_close_bf16(got_y, want_y)
+
+
+@pytest.mark.parametrize(("tokens", "hidden"), [(1, 6144), (33, 6144), (384, 6144)])
+@pytest.mark.parametrize("norm", [False, True], ids=["raw", "norm_fold"])
+def test_post_pre_is_the_three_launch_pipeline(tokens: int, hidden: int, norm: bool) -> None:
+    """One launch, exactly the three-launch result: run_post -> run_pre -> norm.
+
+    The fused boundary must be bit-identical to the composition, including the
+    single BF16 rounding of the updated streams that the gates consume.
+    """
+    streams, fn, hc_scale, hc_base = _make_inputs(
+        tokens=tokens, hidden=hidden, seed=tokens * 19 + hidden
+    )
+    branch = _make_branch(tokens=tokens, hidden=hidden, seed=tokens * 5 + hidden)
+    norm_weight = _make_norm_weight(hidden=hidden, seed=hidden) if norm else None
+    prev_post, _ = ihc.run_pre(streams, fn, hc_scale, hc_base)
+
+    out3 = ihc.run_post(branch, streams, prev_post)
+    post3, y3 = ihc.run_pre(
+        out3, fn, hc_scale, hc_base, norm_weight=norm_weight, layernorm_eps=NORM_EPS
+    )
+    out1, post1, y1 = ihc.run_post_pre(
+        branch,
+        streams,
+        prev_post,
+        fn,
+        hc_scale,
+        hc_base,
+        norm_weight=norm_weight,
+        layernorm_eps=NORM_EPS,
+    )
+    assert torch.equal(out1, out3), "fused update differs from run_post"
+    assert torch.equal(post1, post3), "fused gates differ from run_pre"
+    assert torch.equal(y1, y3), "fused sublayer input differs from run_pre(+norm)"
+
+
+@pytest.mark.parametrize(("tokens", "hidden"), [(33, 6144), (384, 6144)])
+def test_norm_fold_matches_reference(tokens: int, hidden: int) -> None:
+    streams, fn, hc_scale, hc_base = _make_inputs(
+        tokens=tokens, hidden=hidden, seed=tokens * 23 + hidden
+    )
+    norm_weight = _make_norm_weight(hidden=hidden, seed=hidden + 3)
+    post, y = ihc.run_pre(
+        streams, fn, hc_scale, hc_base, norm_weight=norm_weight, layernorm_eps=NORM_EPS
+    )
+    rpost, ry = ref.ihc_pre_reference(streams, fn, hc_scale, hc_base)
+    want = ref.ihc_norm_reference(ry, norm_weight, NORM_EPS)
+    assert_close_post(post, rpost)
+    assert_close_bf16(y, want)
+
+
 @pytest.mark.parametrize(("tokens", "hidden"), [(1, 6144), (384, 6144)])
 def test_torch_and_triton_backends_agree(tokens: int, hidden: int, monkeypatch) -> None:
     streams, fn, hc_scale, hc_base = _make_inputs(
@@ -136,7 +232,6 @@ def test_tuning_table_covers_whitelist(hidden: int) -> None:
     assert hidden % ihc.IHC_GRAM_BLOCK_H == 0
     assert (HC * hidden) % config.block_k == 0
     assert hidden % config.block_d == 0
-
 
 def test_whitelist_accepts_6144_and_rejects_others() -> None:
     # 6144 is the point of the exercise: the mHC whitelist is
@@ -177,7 +272,6 @@ def test_rejects_bad_contracts(mutate) -> None:
     with pytest.raises(ValueError):
         ihc.run_pre(streams, fn, hc_scale, hc_base)
 
-
 def test_out_buffers_match_functional() -> None:
     tokens, hidden = 33, 6144
     streams, fn, hc_scale, hc_base = _make_inputs(tokens=tokens, hidden=hidden, seed=4)
@@ -213,6 +307,31 @@ def test_out_buffers_match_functional() -> None:
     assert_close_bf16(out_h, ihc.run_head(streams, hfn, hs, hb))
 
 
+def test_post_pre_out_buffers_match_functional() -> None:
+    tokens, hidden = 33, 6144
+    streams, fn, hc_scale, hc_base = _make_inputs(tokens=tokens, hidden=hidden, seed=27)
+    branch = _make_branch(tokens=tokens, hidden=hidden, seed=28)
+    prev_post, _ = ihc.run_pre(streams, fn, hc_scale, hc_base)
+    out_streams = torch.empty_like(streams)
+    out_post = torch.empty((tokens, HC), dtype=torch.float32, device="cuda")
+    out_y = torch.empty((tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    got = ihc.run_post_pre(
+        branch,
+        streams,
+        prev_post,
+        fn,
+        hc_scale,
+        hc_base,
+        out_streams=out_streams,
+        out_post=out_post,
+        out_y=out_y,
+    )
+    assert got == (out_streams, out_post, out_y)
+    want = ihc.run_post_pre(branch, streams, prev_post, fn, hc_scale, hc_base)
+    for got_t, want_t in zip(got, want, strict=True):
+        assert_close_bf16(got_t, want_t) if want_t.dtype == torch.bfloat16 else assert_close_post(got_t, want_t)
+
+
 def test_leading_dims_and_post_4x1() -> None:
     """Rank-4 [B, T, 4, H] streams (the HF layout) and [..., 4, 1] post gates."""
     outer, tokens, hidden = (2,), 7, 6144
@@ -227,7 +346,6 @@ def test_leading_dims_and_post_4x1() -> None:
     out = ihc.run_post(branch, streams, post.unsqueeze(-1))
     assert_close_bf16(out, ref.ihc_post_reference(branch, streams, post))
 
-
 def test_zero_tokens_are_served() -> None:
     streams, fn, hc_scale, hc_base = _make_inputs(tokens=0, hidden=6144, seed=9)
     post, y = ihc.run_pre(streams, fn, hc_scale, hc_base)
@@ -235,3 +353,32 @@ def test_zero_tokens_are_served() -> None:
     branch = _make_branch(tokens=0, hidden=6144, seed=10)
     out = ihc.run_post(branch, streams, post)
     assert out.shape == streams.shape
+    out2, post2, y2 = ihc.run_post_pre(branch, streams, post, fn, hc_scale, hc_base)
+    assert out2.shape == streams.shape and y2.shape == (0, 6144)
+
+
+def test_token_offsets_are_int64_beyond_int32_overflow() -> None:
+    """A token row spans 4*6144 elements: int32 offsets overflow at 87,382
+    rows. The whole row range must stay correct past that (long prefill)."""
+    hidden = 6144
+    tokens = 88_000
+    streams, fn, hc_scale, hc_base = _make_inputs(
+        tokens=tokens, hidden=hidden, seed=1234
+    )
+    branch = _make_branch(tokens=tokens, hidden=hidden, seed=1235)
+    post, y = ihc.run_pre(streams, fn, hc_scale, hc_base)
+    # The torch backend is the golden at this size (the CPU reference would
+    # dominate the test); the full parity grid pins it to the reference.
+    import os
+
+    os.environ["B12X_IHC_BACKEND"] = "torch"
+    try:
+        tpost, ty = ihc.run_pre(streams, fn, hc_scale, hc_base)
+        tout = ihc.run_post(branch, streams, post)
+    finally:
+        os.environ.pop("B12X_IHC_BACKEND", None)
+    assert_close_post(post, tpost)
+    assert_close_bf16(y, ty)
+    assert_close_bf16(tout, ihc.run_post(branch, streams, post))
+    # And the tail rows (the ones an int32 offset scrambles) are non-trivial.
+    assert y[87_400:].float().abs().max() > 0

@@ -125,6 +125,11 @@ TUNING_COMPONENTS = (
         variant="default",
     ),
     KernelTuningRegistration(
+        op_qualname="norm.mhc",
+        contract_ref="b12x.norm.mhc._ihc_tuning:TUNING",
+        variant="ihc",
+    ),
+    KernelTuningRegistration(
         op_qualname="norm.torch_rmsnorm",
         contract_ref="b12x.norm._torch_rmsnorm_preparation:TUNING",
     ),

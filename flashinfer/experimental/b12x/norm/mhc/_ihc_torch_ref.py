@@ -47,9 +47,11 @@ IHC_MIXES = 2 * IHC_MULT  # 8 rows: 4 pre + 4 post; mHC's 16 comb rows are gone
 __all__ = [
     "IHC_MULT",
     "IHC_MIXES",
-    "ihc_pre_reference",
-    "ihc_post_reference",
     "ihc_head_reference",
+    "ihc_norm_reference",
+    "ihc_post_pre_reference",
+    "ihc_post_reference",
+    "ihc_pre_reference",
 ]
 
 
@@ -193,3 +195,60 @@ def ihc_head_reference(
     )
     y = (pre.unsqueeze(-1) * streams.float()).sum(dim=-2)
     return y.to(streams.dtype if y_dtype is None else y_dtype)
+
+
+def ihc_norm_reference(
+    y: torch.Tensor,
+    weight: torch.Tensor,
+    layernorm_eps: float,
+) -> torch.Tensor:
+    """Sublayer input RMSNorm over the collapsed ``y`` (the fold the fused
+    ``run_post_pre`` performs in its final passes).
+
+    ``y`` is the BF16 collapse output (the contract's single rounding already
+    happened); the normalization itself is FP32 with one BF16 rounding out::
+
+        out = bf16(weight * float(y) * rsqrt(mean(float(y)^2) + layernorm_eps))
+
+    This is the forced-FP32 form of ``HYV4RMSNorm`` as the decoder layer applies
+    it (``input_layernorm`` / ``post_attention_layernorm``) with an FP32 weight.
+    """
+    yf = y.float()
+    rms = torch.rsqrt(yf.square().mean(dim=-1, keepdim=True) + layernorm_eps)
+    return (weight.float() * yf * rms).to(y.dtype)
+
+
+def ihc_post_pre_reference(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    magnitude: float = 2.0,
+    hc_eps: float = 1.0e-6,
+    norm_eps: float = 1.0e-5,
+    norm_weight: torch.Tensor | None = None,
+    layernorm_eps: float = 1.0e-5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Golden for the fused sublayer boundary.
+
+    ``out = ihc_post_reference(x, residual, prev_post)`` then
+    ``(post, y) = ihc_pre_reference(out, fn, hc_scale, hc_base)`` and, when
+    ``norm_weight`` is given, ``y = ihc_norm_reference(y, norm_weight,
+    layernorm_eps)``. Returns ``(out, post, y)``.
+    """
+    out = ihc_post_reference(x, residual, prev_post)
+    post, y = ihc_pre_reference(
+        out,
+        fn,
+        hc_scale,
+        hc_base,
+        magnitude=magnitude,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+    )
+    if norm_weight is not None:
+        y = ihc_norm_reference(y, norm_weight, layernorm_eps)
+    return out, post, y

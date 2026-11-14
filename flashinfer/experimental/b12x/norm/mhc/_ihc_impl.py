@@ -13,8 +13,8 @@ does no collectives.
 Geometry: hidden 6144 for Hy4 (the mHC whitelist covers 4096/5120/7168 only).
 ``IHC_SUPPORTED_HIDDEN_SIZES`` extends it with 6144, which already satisfies the
 mHC kernel tile rules (``IHC_SOURCE_TILE_H`` / ``IHC_GRAM_BLOCK_H``); the
-per-size launch geometry lives in the ``IHC_TUNING`` table, whose 6144 row is
-what the Hy4 recipe serves.
+per-size launch geometry lives in the ``IHC_TUNING`` table (``_ihc_tuning``),
+whose 6144 row is what the Hy4 recipe serves.
 
 The golden model is ``_ihc_torch_ref`` (pure torch, follows the transformers
 ``HYV4HyperConnection`` / ``HYV4HyperHead`` and vLLM ``HYV4HCPreLayer`` /
@@ -25,32 +25,59 @@ composable torch path, ``auto`` uses Triton when importable). The torch path is
 written independently of the reference (einsum/addcmul formulation) so the
 operator-versus-reference comparison is never comparing a file to itself.
 
-Caller-owned ``out=`` buffers are supported outside ``torch.compile``; the
-allocation-free path is what a decode loop binds. The functional (allocating)
-forms run through registered ``b12x::ihc_*`` custom ops so they trace under
-torch.compile and CUDA graph capture.
+Numerical contract: every step accumulates in FP32 and rounds to BF16 exactly
+once on the way out ("exactly one BF16 rounding"), including the fused
+sublayer-input RMSNorm fold (``norm_weight`` / ``layernorm_eps``), and the
+fused ``run_post_pre`` boundary is bit-comparable with the three-launch
+``run_post`` -> ``run_pre`` -> RMSNorm pipeline: the gates see the BF16-rounded
+updated streams in both.
+
+b12x integration mirrors the mHC fused kernels: ``_ihc_tuning`` registers an
+``IhcQuery`` / ``IhcConfig`` ``TuningContract`` (``norm.mhc.ihc``, catalog
+variant ``ihc``), ``_ihc_preparation`` exposes ``plan_ihc`` for
+``PreparationSession``, and ``B12XIHCCaps`` / ``B12XIHCBinding`` /
+``_IhcState.bind`` provide the caller-owned-buffer binding surface. The
+functional (allocating) forms run through registered ``b12x::ihc_*`` custom ops
+so they trace under ``torch.compile`` and CUDA graph capture; bound forms run
+through the mutating ``b12x::ihc_bound`` op. Caller-owned ``out=`` buffers are
+also supported outside ``torch.compile``.
+
+Token-row offsets are computed in int64 inside the Triton kernels: a token row
+spans ``4 * hidden`` elements and int32 offsets overflow above ~87k rows at
+hidden 6144.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
 from dataclasses import dataclass
+from collections.abc import Callable, Mapping
 
 import torch
+from b12x._lib.scratch import ScratchBufferSpec
+from b12x.preparation import Plan, plan_from_handle, require_prepared
 
-IHC_MULT = 4
-IHC_MIXES = 2 * IHC_MULT  # 8 rows: 4 pre + 4 post; mHC's comb rows are absent
-# The mHC fused-kernel whitelist is (4096, 5120, 7168); Hy4 needs 6144, which
-# already satisfies the kernel tile divisibility below.
-IHC_SUPPORTED_HIDDEN_SIZES = (4096, 5120, 6144, 7168)
-IHC_SOURCE_TILE_H = 128  # same source tile as the mHC Gram kernel
-IHC_GRAM_BLOCK_H = 1024  # same Gram block as the mHC Gram kernel
-IHC_DEFAULT_MAGNITUDE = 2.0  # hc_magnitude in the Hy4 config
-IHC_DEFAULT_HC_EPS = 1.0e-6  # hc_eps in the Hy4 config
-IHC_DEFAULT_NORM_EPS = 1.0e-5  # rms_norm_eps in the Hy4 config
+from ._ihc_tuning import (
+    IHC_BACKENDS,
+    IHC_DEFAULT_HC_EPS,
+    IHC_DEFAULT_MAGNITUDE,
+    IHC_DEFAULT_NORM_EPS,
+    IHC_GRAM_BLOCK_H,
+    IHC_MIXES,
+    IHC_MULT,
+    IHC_SOURCE_TILE_H,
+    IHC_SUPPORTED_HIDDEN_SIZES,
+    IHC_TUNING,
+    IhcConfig,
+    IhcQuery,
+    tuning_for,
+)
+
+IHC_SUPPORTED_RMS_EPS = (IHC_DEFAULT_NORM_EPS,)
 
 __all__ = [
+    "B12XIHCBinding",
+    "B12XIHCCaps",
     "IHC_DEFAULT_HC_EPS",
     "IHC_DEFAULT_MAGNITUDE",
     "IHC_DEFAULT_NORM_EPS",
@@ -61,69 +88,14 @@ __all__ = [
     "IHC_SUPPORTED_HIDDEN_SIZES",
     "IHC_TUNING",
     "IhcConfig",
+    "IhcQuery",
     "is_supported",
     "run_head",
     "run_post",
+    "run_post_pre",
     "run_pre",
     "tuning_for",
 ]
-
-
-@dataclass(frozen=True, kw_only=True)
-class IhcConfig:
-    """Tuned launch geometry for one hidden size.
-
-    ``block_k`` is the projection K-loop chunk (must divide ``4 * hidden``);
-    ``block_d`` is the collapse/update D-loop chunk (must divide ``hidden``);
-    ``num_warps`` is the Triton warp count. Tile divisibility mirrors the mHC
-    fused Gram kernel (``IHC_SOURCE_TILE_H`` / ``IHC_GRAM_BLOCK_H``).
-    """
-
-    hidden_size: int
-    block_k: int
-    block_d: int
-    num_warps: int
-    backend: str = "triton_fused"
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "hidden_size": self.hidden_size,
-            "block_k": self.block_k,
-            "block_d": self.block_d,
-            "num_warps": self.num_warps,
-            "backend": self.backend,
-        }
-
-
-# Tuning table. One row per whitelisted hidden size; the 6144 row serves Hy4.
-IHC_TUNING: Mapping[int, IhcConfig] = {
-    4096: IhcConfig(hidden_size=4096, block_k=1024, block_d=256, num_warps=4),
-    5120: IhcConfig(hidden_size=5120, block_k=1024, block_d=256, num_warps=4),
-    6144: IhcConfig(hidden_size=6144, block_k=1024, block_d=512, num_warps=8),
-    7168: IhcConfig(hidden_size=7168, block_k=1024, block_d=512, num_warps=8),
-}
-
-
-def tuning_for(hidden_size: int) -> IhcConfig:
-    """Return the tuned launch configuration for a whitelisted hidden size."""
-    hidden_size = int(hidden_size)
-    config = IHC_TUNING.get(hidden_size)
-    if config is None:
-        raise ValueError(
-            f"iHC hidden size must be one of {IHC_SUPPORTED_HIDDEN_SIZES} "
-            f"(mHC's 4096/5120/7168 plus Hy4's 6144); got {hidden_size}"
-        )
-    if (
-        hidden_size % IHC_SOURCE_TILE_H
-        or hidden_size % IHC_GRAM_BLOCK_H
-        or (IHC_MULT * hidden_size) % config.block_k
-        or hidden_size % config.block_d
-    ):
-        raise ValueError(
-            f"hidden size {hidden_size} violates the iHC tile divisibility "
-            f"({IHC_SOURCE_TILE_H} / {IHC_GRAM_BLOCK_H} / block_k / block_d)"
-        )
-    return config
 
 
 def is_supported(device=None) -> bool:
@@ -220,6 +192,29 @@ def _validate_gate_weights(
     _require_contiguous(hc_base, name=name_base)
 
 
+def _validate_norm_weight(
+    norm_weight: torch.Tensor | None,
+    *,
+    hidden_size: int,
+    device: torch.device,
+) -> None:
+    if norm_weight is None:
+        return
+    if norm_weight.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            "norm_weight must be float32 or bfloat16, got "
+            f"{norm_weight.dtype}"
+        )
+    if tuple(norm_weight.shape) != (hidden_size,):
+        raise ValueError(
+            f"norm_weight must have shape {(hidden_size,)}, "
+            f"got {tuple(norm_weight.shape)}"
+        )
+    if norm_weight.device != device:
+        raise ValueError("norm_weight must be on the residual device")
+    _require_contiguous(norm_weight, name="norm_weight")
+
+
 def _flatten_tokens(tensor: torch.Tensor, tail: int) -> torch.Tensor:
     return tensor.reshape(-1, tail)
 
@@ -249,6 +244,14 @@ def _validate_out(
 # ---------------------------------------------------------------------------
 
 
+def _ihc_norm_torch(
+    y: torch.Tensor, norm_weight: torch.Tensor, layernorm_eps: float
+) -> torch.Tensor:
+    yf = y.float()
+    rms = torch.rsqrt(yf.square().mean(dim=-1, keepdim=True) + layernorm_eps)
+    return (norm_weight.float() * yf * rms).to(y.dtype)
+
+
 def _ihc_pre_torch(
     streams: torch.Tensor,
     fn: torch.Tensor,
@@ -258,6 +261,8 @@ def _ihc_pre_torch(
     magnitude: float,
     hc_eps: float,
     norm_eps: float,
+    norm_weight: torch.Tensor | None = None,
+    layernorm_eps: float = IHC_DEFAULT_NORM_EPS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     t_n = streams.numel() // (IHC_MULT * streams.shape[-1])
     hidden = int(streams.shape[-1])
@@ -273,9 +278,12 @@ def _ihc_pre_torch(
     )
     streams_flat = _flatten_tokens(streams, IHC_MULT * hidden).float()
     y = torch.einsum("tih,ti->th", streams_flat.view(t_n, IHC_MULT, hidden), pre)
+    y = y.reshape(streams.shape[:-2] + (hidden,)).to(streams.dtype)
+    if norm_weight is not None:
+        y = _ihc_norm_torch(y, norm_weight, layernorm_eps)
     return (
         post.reshape(streams.shape[:-2] + (IHC_MULT,)),
-        y.reshape(streams.shape[:-2] + (hidden,)).to(streams.dtype),
+        y,
     )
 
 
@@ -288,6 +296,35 @@ def _ihc_post_torch(
         x.float().unsqueeze(-2),
     )
     return out.to(x.dtype)
+
+
+def _ihc_post_pre_torch(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    magnitude: float,
+    hc_eps: float,
+    norm_eps: float,
+    norm_weight: torch.Tensor | None = None,
+    layernorm_eps: float = IHC_DEFAULT_NORM_EPS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    out = _ihc_post_torch(x, residual, prev_post)
+    post, y = _ihc_pre_torch(
+        out,
+        fn,
+        hc_scale,
+        hc_base,
+        magnitude=magnitude,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        norm_weight=norm_weight,
+        layernorm_eps=layernorm_eps,
+    )
+    return out, post, y
 
 
 def _ihc_head_torch(
@@ -315,6 +352,10 @@ def _ihc_head_torch(
 # ---------------------------------------------------------------------------
 
 
+def triton_cdiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
 def _ihc_pre_triton(
     streams: torch.Tensor,
     fn: torch.Tensor,
@@ -324,6 +365,8 @@ def _ihc_pre_triton(
     magnitude: float,
     hc_eps: float,
     norm_eps: float,
+    norm_weight: torch.Tensor | None,
+    layernorm_eps: float,
     post: torch.Tensor,
     y: torch.Tensor,
     config: IhcConfig,
@@ -347,8 +390,11 @@ def _ihc_pre_triton(
         float(magnitude),
         float(hc_eps),
         float(norm_eps),
+        norm_weight if norm_weight is not None else hc_base,
+        float(layernorm_eps),
         BLOCK_K=config.block_k,
         BLOCK_D=config.block_d,
+        FUSE_NORM=norm_weight is not None,
         num_warps=config.num_warps,
     )
 
@@ -375,7 +421,60 @@ def _ihc_post_triton(
         post_flat,
         out_flat,
         hidden,
+        IHC_MULT * hidden,
         BLOCK_D=config.block_d,
+        num_warps=config.num_warps,
+    )
+
+
+def _ihc_post_pre_triton(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    magnitude: float,
+    hc_eps: float,
+    norm_eps: float,
+    norm_weight: torch.Tensor | None,
+    layernorm_eps: float,
+    out_streams: torch.Tensor,
+    post: torch.Tensor,
+    y: torch.Tensor,
+    config: IhcConfig,
+) -> None:
+    from ._ihc_kernels import _ihc_post_pre_kernel
+
+    hidden = int(residual.shape[-1])
+    t_n = residual.numel() // (IHC_MULT * hidden)
+    x_flat = _flatten_tokens(x, hidden)
+    residual_flat = _flatten_tokens(residual, IHC_MULT * hidden)
+    prev_post_flat = _flatten_tokens(prev_post, IHC_MULT)
+    out_flat = _flatten_tokens(out_streams, IHC_MULT * hidden)
+    y_flat = _flatten_tokens(y, hidden)
+    post_flat = _flatten_tokens(post, IHC_MULT)
+    _ihc_post_pre_kernel[(t_n,)](
+        x_flat,
+        residual_flat,
+        prev_post_flat,
+        fn,
+        hc_scale,
+        hc_base,
+        out_flat,
+        post_flat,
+        y_flat,
+        hidden,
+        IHC_MULT * hidden,
+        float(magnitude),
+        float(hc_eps),
+        float(norm_eps),
+        norm_weight if norm_weight is not None else hc_base,
+        float(layernorm_eps),
+        BLOCK_K=config.block_k,
+        BLOCK_D=config.block_d,
+        FUSE_NORM=norm_weight is not None,
         num_warps=config.num_warps,
     )
 
@@ -413,8 +512,436 @@ def _ihc_head_triton(
     )
 
 
-def triton_cdiv(a: int, b: int) -> int:
-    return (a + b - 1) // b
+# ---------------------------------------------------------------------------
+# Launchers: one closure per operation, backend and tuning row resolved. The
+# preparation module attaches compiled programs to the same entry points.
+# ---------------------------------------------------------------------------
+
+
+def _torch_launcher(operation: str, config: IhcConfig) -> Callable:
+    def launch_pre(
+        streams,
+        fn,
+        hc_scale,
+        hc_base,
+        *,
+        magnitude,
+        hc_eps,
+        norm_eps,
+        norm_weight,
+        layernorm_eps,
+        post,
+        y,
+    ):
+        got_post, got_y = _ihc_pre_torch(
+            streams,
+            fn,
+            hc_scale,
+            hc_base,
+            magnitude=magnitude,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            norm_weight=norm_weight,
+            layernorm_eps=layernorm_eps,
+        )
+        post.copy_(got_post)
+        y.copy_(got_y)
+
+    def launch_post(x, residual, post, *, out):
+        out.copy_(_ihc_post_torch(x, residual, post))
+
+    def launch_post_pre(
+        x,
+        residual,
+        prev_post,
+        fn,
+        hc_scale,
+        hc_base,
+        *,
+        magnitude,
+        hc_eps,
+        norm_eps,
+        norm_weight,
+        layernorm_eps,
+        out_streams,
+        post,
+        y,
+    ):
+        got_out, got_post, got_y = _ihc_post_pre_torch(
+            x,
+            residual,
+            prev_post,
+            fn,
+            hc_scale,
+            hc_base,
+            magnitude=magnitude,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            norm_weight=norm_weight,
+            layernorm_eps=layernorm_eps,
+        )
+        out_streams.copy_(got_out)
+        post.copy_(got_post)
+        y.copy_(got_y)
+
+    def launch_head(streams, fn, hc_head_scale, hc_head_base, *, hc_eps, norm_eps, y):
+        y.copy_(
+            _ihc_head_torch(
+                streams,
+                fn,
+                hc_head_scale,
+                hc_head_base,
+                hc_eps=hc_eps,
+                norm_eps=norm_eps,
+            )
+        )
+
+    return {
+        "pre": launch_pre,
+        "post": launch_post,
+        "post_pre": launch_post_pre,
+        "head": launch_head,
+    }[operation]
+
+
+def _triton_launcher(operation: str, config: IhcConfig) -> Callable:
+    if operation == "pre":
+
+        def launch(
+            streams,
+            fn,
+            hc_scale,
+            hc_base,
+            *,
+            magnitude,
+            hc_eps,
+            norm_eps,
+            norm_weight,
+            layernorm_eps,
+            post,
+            y,
+        ):
+            _ihc_pre_triton(
+                streams,
+                fn,
+                hc_scale,
+                hc_base,
+                magnitude=magnitude,
+                hc_eps=hc_eps,
+                norm_eps=norm_eps,
+                norm_weight=norm_weight,
+                layernorm_eps=layernorm_eps,
+                post=post,
+                y=y,
+                config=config,
+            )
+
+        return launch
+    if operation == "post":
+
+        def launch(x, residual, post, *, out):
+            _ihc_post_triton(x, residual, post, out, config)
+
+        return launch
+    if operation == "post_pre":
+
+        def launch(
+            x,
+            residual,
+            prev_post,
+            fn,
+            hc_scale,
+            hc_base,
+            *,
+            magnitude,
+            hc_eps,
+            norm_eps,
+            norm_weight,
+            layernorm_eps,
+            out_streams,
+            post,
+            y,
+        ):
+            _ihc_post_pre_triton(
+                x,
+                residual,
+                prev_post,
+                fn,
+                hc_scale,
+                hc_base,
+                magnitude=magnitude,
+                hc_eps=hc_eps,
+                norm_eps=norm_eps,
+                norm_weight=norm_weight,
+                layernorm_eps=layernorm_eps,
+                out_streams=out_streams,
+                post=post,
+                y=y,
+                config=config,
+            )
+
+        return launch
+
+    def launch(streams, fn, hc_head_scale, hc_head_base, *, hc_eps, norm_eps, y):
+        _ihc_head_triton(
+            streams,
+            fn,
+            hc_head_scale,
+            hc_head_base,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            y=y,
+            config=config,
+        )
+
+    return launch
+
+
+def _launchers_for(
+    config: IhcConfig, backend: str | None = None
+) -> Mapping[str, Callable]:
+    backend = config.backend if backend is None else backend
+    factory = _torch_launcher if backend == "torch" else _triton_launcher
+    return {op: factory(op, config) for op in ("pre", "post", "post_pre", "head")}
+
+
+# ---------------------------------------------------------------------------
+# Prepared plan surface: caps / binding / state (the mHC pattern).
+# ---------------------------------------------------------------------------
+
+
+def _canonical_device(device: torch.device | str) -> torch.device:
+    result = torch.device(device)
+    if result.type == "cuda" and result.index is None:
+        result = torch.device("cuda", torch.cuda.current_device())
+    return result
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XIHCCaps:
+    """Token capacity and static iHC geometry for one prepared plan."""
+
+    device: torch.device | str
+    max_tokens: int
+    hidden_size: int
+    dtype: torch.dtype = torch.bfloat16
+
+    def __post_init__(self) -> None:
+        device = _canonical_device(self.device)
+        max_tokens = int(self.max_tokens)
+        hidden_size = int(self.hidden_size)
+        if max_tokens <= 0:
+            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+        tuning_for(hidden_size)  # whitelist + tile check
+        if self.dtype != torch.bfloat16:
+            raise ValueError(
+                f"iHC scratch currently supports torch.bfloat16 outputs, got {self.dtype}"
+            )
+        object.__setattr__(self, "device", device)
+        object.__setattr__(self, "max_tokens", max_tokens)
+        object.__setattr__(self, "hidden_size", hidden_size)
+
+
+@dataclass(frozen=True, kw_only=True)
+class B12XIHCBinding:
+    """Caller-owned output buffers bound to one prepared iHC state.
+
+    Mutating custom ops target the capacity tensors directly; the accessor
+    views expose only the live token prefix to downstream operators.
+    """
+
+    state: "_IhcState"
+    tokens: int
+    out_streams: torch.Tensor | None = None
+    post_buffer: torch.Tensor | None = None
+    y: torch.Tensor | None = None
+    plan: Plan | None = None
+
+    def _view(self, tensor: torch.Tensor | None) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        return tensor[: self.tokens]
+
+    def pre(self, streams, fn, hc_scale, hc_base, **kwargs):
+        return run_pre(
+            streams, fn, hc_scale, hc_base, binding=self, **kwargs
+        )
+
+    def post(self, x, residual, post, **kwargs):
+        return run_post(x, residual, post, binding=self, **kwargs)
+
+    def post_pre(
+        self, x, residual, prev_post, fn, hc_scale, hc_base, **kwargs
+    ):
+        return run_post_pre(
+            x, residual, prev_post, fn, hc_scale, hc_base, binding=self, **kwargs
+        )
+
+    def head(self, streams, fn, hc_head_scale, hc_head_base, **kwargs):
+        return run_head(
+            streams, fn, hc_head_scale, hc_head_base, binding=self, **kwargs
+        )
+
+
+@dataclass(frozen=True)
+class _IhcState:
+    """One immutable, already-lowered iHC operation family and its launchers."""
+
+    caps: B12XIHCCaps
+    query: IhcQuery
+    config: IhcConfig
+    launchers: Mapping[str, Callable]
+
+    def require(
+        self,
+        operation: str,
+        tensor: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor | None = None,
+        magnitude: float | None = None,
+        hc_eps: float | None = None,
+        norm_eps: float | None = None,
+        layernorm_eps: float | None = None,
+    ) -> None:
+        query = self.query
+        if operation != query.operation:
+            raise ValueError(f"execution prepares {query.operation}, not {operation}")
+        if tensor.device != self.caps.device:
+            raise ValueError("iHC tensor and prepared device differ")
+        if (
+            not 0 <= tensor.shape[0] <= query.max_tokens
+            or tensor.shape[-1] != query.hidden_size
+        ):
+            raise ValueError(
+                "iHC tensor exceeds its planned token capacity or differs in hidden size"
+            )
+        if (norm_weight is not None) != query.has_norm_weight:
+            raise ValueError("iHC normalization operand presence changed")
+        if norm_weight is not None and (
+            str(norm_weight.dtype).removeprefix("torch.") != query.norm_weight_dtype
+        ):
+            raise ValueError("iHC normalization dtype changed")
+        if magnitude is not None and float(magnitude) != query.magnitude:
+            raise ValueError("iHC magnitude differs from the prepared invocation")
+        if (hc_eps is not None and float(hc_eps) != query.hc_eps) or (
+            norm_eps is not None and float(norm_eps) != query.norm_eps
+        ):
+            raise ValueError("iHC gate recipe differs from the prepared invocation")
+        if layernorm_eps is not None and float(layernorm_eps) != query.layernorm_eps:
+            raise ValueError(
+                "iHC folded RMSNorm epsilon differs from the prepared invocation"
+            )
+
+    def scratch_specs(self) -> tuple[ScratchBufferSpec, ...]:
+        """iHC launches need no anonymous scratch allocation."""
+        return ()
+
+    def _live_tokens(self, tokens: int | None) -> int:
+        live = self.caps.max_tokens if tokens is None else int(tokens)
+        if not 0 <= live <= self.caps.max_tokens:
+            raise ValueError(f"tokens={live} exceeds capacity {self.caps.max_tokens}")
+        return live
+
+    def bind(
+        self,
+        *,
+        out_streams: torch.Tensor | None = None,
+        post: torch.Tensor | None = None,
+        y: torch.Tensor | None = None,
+        tokens: int | None = None,
+        plan: Plan | None = None,
+    ) -> B12XIHCBinding:
+        live = self._live_tokens(tokens)
+        caps = self.caps
+        hidden = int(caps.hidden_size)
+        for name, tensor, tail, dtype in (
+            ("out_streams", out_streams, (IHC_MULT, hidden), torch.bfloat16),
+            ("post", post, (IHC_MULT,), torch.float32),
+            ("y", y, (hidden,), torch.bfloat16),
+        ):
+            if tensor is None:
+                continue
+            if tensor.ndim != len(tail) + 1 or tuple(tensor.shape[1:]) != tail:
+                raise ValueError(
+                    f"{name} must have tail shape {tail}, got {tuple(tensor.shape)}"
+                )
+            if int(tensor.shape[0]) < live:
+                raise ValueError(
+                    f"{name} capacity {int(tensor.shape[0])} is smaller than "
+                    f"tokens={live}"
+                )
+            if tensor.dtype != dtype or tensor.device != caps.device:
+                raise ValueError(
+                    f"{name} must use dtype={dtype} and device={caps.device}; "
+                    f"got dtype={tensor.dtype}, device={tensor.device}"
+                )
+            _require_contiguous(tensor, name=name)
+        return B12XIHCBinding(
+            state=self,
+            plan=plan,
+            tokens=live,
+            out_streams=out_streams,
+            post_buffer=post,
+            y=y,
+        )
+
+
+def _prepared_state(plan, *, output_mode=None):
+    state = require_prepared(plan, "norm.mhc.ihc")
+    if output_mode is not None and state.query.output_mode != output_mode:
+        raise ValueError("iHC output form differs from prepared invocation")
+    return state
+
+
+def _state_and_launcher(
+    operation: str,
+    tensor: torch.Tensor,
+    hidden: int,
+    *,
+    state: _IhcState | None,
+    norm_weight,
+    magnitude,
+    hc_eps,
+    norm_eps,
+    layernorm_eps,
+) -> Callable:
+    if state is not None:
+        state.require(
+            operation,
+            tensor,
+            norm_weight=norm_weight,
+            magnitude=magnitude,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            layernorm_eps=layernorm_eps,
+        )
+        return state.launchers[operation]
+    config = tuning_for(hidden)
+    backend = _resolve_backend(tensor)
+    if config.backend == "torch":
+        backend = "torch"
+    return _launchers_for(config, backend)[operation]
+
+
+def _binding_outputs(
+    binding: B12XIHCBinding | None,
+    *,
+    names: tuple[str, ...],
+    state: _IhcState | None,
+):
+    if binding is None:
+        return {name: None for name in names}
+    if state is not None and binding.state is not state:
+        raise ValueError("binding and plan have different prepared states")
+    outputs = {}
+    for name in names:
+        value = getattr(binding, {"out_streams": "out_streams", "post": "post_buffer", "y": "y"}[name])
+        if value is None:
+            raise ValueError(
+                f"iHC binding lacks the {name} buffer this operation writes"
+            )
+        outputs[name] = value[: binding.tokens]
+    return outputs
 
 
 # ---------------------------------------------------------------------------
@@ -431,19 +958,39 @@ def _ihc_pre_impl(
     magnitude: float,
     hc_eps: float,
     norm_eps: float,
+    norm_weight: torch.Tensor | None = None,
+    layernorm_eps: float = IHC_DEFAULT_NORM_EPS,
     out_post: torch.Tensor | None = None,
     out_y: torch.Tensor | None = None,
+    binding: B12XIHCBinding | None = None,
+    _state: _IhcState | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     hidden = _validate_streams(streams)
     _validate_fn(fn, hidden_size=hidden, rows=IHC_MIXES)
     _validate_gate_weights(hc_scale, hc_base, device=streams.device)
+    _validate_norm_weight(norm_weight, hidden_size=hidden, device=streams.device)
     magnitude = float(magnitude)
     if not magnitude > 0.0:
         raise ValueError(f"magnitude must be positive, got {magnitude}")
     hc_eps = _validate_eps("hc_eps", hc_eps)
     norm_eps = _validate_eps("norm_eps", norm_eps)
+    layernorm_eps = _validate_eps("layernorm_eps", layernorm_eps)
+    bound = _binding_outputs(
+        binding, names=("post", "y"), state=_state
+    )
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (("out_post", out_post), ("out_y", out_y))
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "iHC binding owns output buffers; do not also pass "
+                + ", ".join(extras)
+            )
+        out_post, out_y = bound["post"], bound["y"]
     outer = tuple(streams.shape[:-2])
-    config = tuning_for(hidden)
     out_post = _validate_out(
         out_post,
         shape=outer + (IHC_MULT,),
@@ -469,31 +1016,30 @@ def _ihc_pre_impl(
         )
     if t_n == 0:
         return out_post, out_y
-    if _resolve_backend(streams) == "triton":
-        _ihc_pre_triton(
-            streams,
-            fn,
-            hc_scale,
-            hc_base,
-            magnitude=magnitude,
-            hc_eps=hc_eps,
-            norm_eps=norm_eps,
-            post=out_post,
-            y=out_y,
-            config=config,
-        )
-    else:
-        post, y = _ihc_pre_torch(
-            streams,
-            fn,
-            hc_scale,
-            hc_base,
-            magnitude=magnitude,
-            hc_eps=hc_eps,
-            norm_eps=norm_eps,
-        )
-        out_post.copy_(post)
-        out_y.copy_(y)
+    launcher = _state_and_launcher(
+        "pre",
+        streams,
+        hidden,
+        state=_state,
+        norm_weight=norm_weight,
+        magnitude=magnitude,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        layernorm_eps=layernorm_eps,
+    )
+    launcher(
+        streams,
+        fn,
+        hc_scale,
+        hc_base,
+        magnitude=magnitude,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        norm_weight=norm_weight,
+        layernorm_eps=layernorm_eps,
+        post=out_post,
+        y=out_y,
+    )
     return out_post, out_y
 
 
@@ -503,6 +1049,8 @@ def _ihc_post_impl(
     post: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
+    binding: B12XIHCBinding | None = None,
+    _state: _IhcState | None = None,
 ) -> torch.Tensor:
     hidden = _validate_streams(residual, name="residual")
     if x.dtype != torch.bfloat16:
@@ -525,6 +1073,13 @@ def _ihc_post_impl(
     if post.device != residual.device:
         raise ValueError("post must be on the residual device")
     _require_contiguous(post, name="post")
+    bound = _binding_outputs(binding, names=("out_streams",), state=_state)
+    if binding is not None:
+        if out is not None:
+            raise ValueError(
+                "iHC binding owns output buffers; do not also pass out"
+            )
+        out = bound["out_streams"]
     outer = tuple(residual.shape[:-2])
     out = _validate_out(
         out,
@@ -537,12 +1092,153 @@ def _ihc_post_impl(
         out = torch.empty_like(residual)
     if residual.numel() == 0:
         return out
-    config = tuning_for(hidden)
-    if _resolve_backend(residual) == "triton":
-        _ihc_post_triton(x, residual, post, out, config)
-    else:
-        out.copy_(_ihc_post_torch(x, residual, post))
+    launcher = _state_and_launcher(
+        "post",
+        residual,
+        hidden,
+        state=_state,
+        norm_weight=None,
+        magnitude=None,
+        hc_eps=None,
+        norm_eps=None,
+        layernorm_eps=None,
+    )
+    launcher(x, residual, post, out=out)
     return out
+
+
+def _ihc_post_pre_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    magnitude: float = IHC_DEFAULT_MAGNITUDE,
+    hc_eps: float = IHC_DEFAULT_HC_EPS,
+    norm_eps: float = IHC_DEFAULT_NORM_EPS,
+    norm_weight: torch.Tensor | None = None,
+    layernorm_eps: float = IHC_DEFAULT_NORM_EPS,
+    out_streams: torch.Tensor | None = None,
+    out_post: torch.Tensor | None = None,
+    out_y: torch.Tensor | None = None,
+    binding: B12XIHCBinding | None = None,
+    _state: _IhcState | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    hidden = _validate_streams(residual, name="residual")
+    if x.dtype != torch.bfloat16:
+        raise ValueError(f"x must be torch.bfloat16, got {x.dtype}")
+    if tuple(x.shape) != tuple(residual.shape[:-2]) + (hidden,):
+        raise ValueError(
+            f"x must have shape {tuple(residual.shape[:-2]) + (hidden,)}, "
+            f"got {tuple(x.shape)}"
+        )
+    if x.device != residual.device:
+        raise ValueError("x and residual must be on the same device")
+    _require_contiguous(x, name="x")
+    if prev_post.dtype != torch.float32 or tuple(prev_post.shape) != tuple(
+        residual.shape[:-2]
+    ) + (IHC_MULT,):
+        raise ValueError(
+            "prev_post must be float32 shape "
+            f"{tuple(residual.shape[:-2]) + (IHC_MULT,)}, "
+            f"got {prev_post.dtype} {tuple(prev_post.shape)}"
+        )
+    if prev_post.device != residual.device:
+        raise ValueError("prev_post must be on the residual device")
+    _require_contiguous(prev_post, name="prev_post")
+    _validate_fn(fn, hidden_size=hidden, rows=IHC_MIXES)
+    _validate_gate_weights(hc_scale, hc_base, device=residual.device)
+    _validate_norm_weight(norm_weight, hidden_size=hidden, device=residual.device)
+    magnitude = float(magnitude)
+    if not magnitude > 0.0:
+        raise ValueError(f"magnitude must be positive, got {magnitude}")
+    hc_eps = _validate_eps("hc_eps", hc_eps)
+    norm_eps = _validate_eps("norm_eps", norm_eps)
+    layernorm_eps = _validate_eps("layernorm_eps", layernorm_eps)
+    bound = _binding_outputs(
+        binding, names=("out_streams", "post", "y"), state=_state
+    )
+    if binding is not None:
+        extras = [
+            name
+            for name, value in (
+                ("out_streams", out_streams),
+                ("out_post", out_post),
+                ("out_y", out_y),
+            )
+            if value is not None
+        ]
+        if extras:
+            raise ValueError(
+                "iHC binding owns output buffers; do not also pass "
+                + ", ".join(extras)
+            )
+        out_streams, out_post, out_y = bound["out_streams"], bound["post"], bound["y"]
+    outer = tuple(residual.shape[:-2])
+    out_streams = _validate_out(
+        out_streams,
+        shape=outer + (IHC_MULT, hidden),
+        dtype=torch.bfloat16,
+        device=residual.device,
+        name="out_streams",
+    )
+    out_post = _validate_out(
+        out_post,
+        shape=outer + (IHC_MULT,),
+        dtype=torch.float32,
+        device=residual.device,
+        name="out_post",
+    )
+    out_y = _validate_out(
+        out_y,
+        shape=outer + (hidden,),
+        dtype=torch.bfloat16,
+        device=residual.device,
+        name="out_y",
+    )
+    t_n = residual.numel() // (IHC_MULT * hidden)
+    if out_streams is None:
+        out_streams = torch.empty_like(residual)
+    if out_post is None:
+        out_post = torch.empty(
+            outer + (IHC_MULT,), dtype=torch.float32, device=residual.device
+        )
+    if out_y is None:
+        out_y = torch.empty(
+            outer + (hidden,), dtype=torch.bfloat16, device=residual.device
+        )
+    if t_n == 0:
+        return out_streams, out_post, out_y
+    launcher = _state_and_launcher(
+        "post_pre",
+        residual,
+        hidden,
+        state=_state,
+        norm_weight=norm_weight,
+        magnitude=magnitude,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        layernorm_eps=layernorm_eps,
+    )
+    launcher(
+        x,
+        residual,
+        prev_post,
+        fn,
+        hc_scale,
+        hc_base,
+        magnitude=magnitude,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        norm_weight=norm_weight,
+        layernorm_eps=layernorm_eps,
+        out_streams=out_streams,
+        post=out_post,
+        y=out_y,
+    )
+    return out_streams, out_post, out_y
 
 
 def _ihc_head_impl(
@@ -554,6 +1250,8 @@ def _ihc_head_impl(
     hc_eps: float,
     norm_eps: float,
     out: torch.Tensor | None = None,
+    binding: B12XIHCBinding | None = None,
+    _state: _IhcState | None = None,
 ) -> torch.Tensor:
     hidden = _validate_streams(streams)
     _validate_fn(fn, hidden_size=hidden, rows=IHC_MULT, name="fn")
@@ -576,6 +1274,13 @@ def _ihc_head_impl(
     _require_contiguous(hc_head_base, name="hc_head_base")
     hc_eps = _validate_eps("hc_eps", hc_eps)
     norm_eps = _validate_eps("norm_eps", norm_eps)
+    bound = _binding_outputs(binding, names=("y",), state=_state)
+    if binding is not None:
+        if out is not None:
+            raise ValueError(
+                "iHC binding owns output buffers; do not also pass out"
+            )
+        out = bound["y"]
     outer = tuple(streams.shape[:-2])
     out = _validate_out(
         out,
@@ -590,29 +1295,26 @@ def _ihc_head_impl(
         )
     if streams.numel() == 0:
         return out
-    config = tuning_for(hidden)
-    if _resolve_backend(streams) == "triton":
-        _ihc_head_triton(
-            streams,
-            fn,
-            hc_head_scale,
-            hc_head_base,
-            hc_eps=hc_eps,
-            norm_eps=norm_eps,
-            y=out,
-            config=config,
-        )
-    else:
-        out.copy_(
-            _ihc_head_torch(
-                streams,
-                fn,
-                hc_head_scale,
-                hc_head_base,
-                hc_eps=hc_eps,
-                norm_eps=norm_eps,
-            )
-        )
+    launcher = _state_and_launcher(
+        "head",
+        streams,
+        hidden,
+        state=_state,
+        norm_weight=None,
+        magnitude=None,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        layernorm_eps=None,
+    )
+    launcher(
+        streams,
+        fn,
+        hc_head_scale,
+        hc_head_base,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        y=out,
+    )
     return out
 
 
@@ -628,9 +1330,11 @@ def _ihc_pre_op(
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
     hc_base: torch.Tensor,
+    norm_weight: torch.Tensor | None,
     magnitude: float,
     hc_eps: float,
     norm_eps: float,
+    layernorm_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _ihc_pre_impl(
         streams,
@@ -640,11 +1344,15 @@ def _ihc_pre_op(
         magnitude=magnitude,
         hc_eps=hc_eps,
         norm_eps=norm_eps,
+        norm_weight=norm_weight,
+        layernorm_eps=layernorm_eps,
     )
 
 
 @_ihc_pre_op.register_fake
-def _ihc_pre_op_fake(streams, fn, hc_scale, hc_base, magnitude, hc_eps, norm_eps):
+def _ihc_pre_op_fake(
+    streams, fn, hc_scale, hc_base, norm_weight, magnitude, hc_eps, norm_eps, layernorm_eps
+):
     outer = tuple(streams.shape[:-2])
     hidden = int(streams.shape[-1])
     return (
@@ -663,6 +1371,58 @@ def _ihc_post_op(
 @_ihc_post_op.register_fake
 def _ihc_post_op_fake(x, residual, post):
     return torch.empty_like(residual)
+
+
+@torch.library.custom_op("b12x::ihc_post_pre", mutates_args=())
+def _ihc_post_pre_op(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    magnitude: float,
+    hc_eps: float,
+    norm_eps: float,
+    layernorm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _ihc_post_pre_impl(
+        x,
+        residual,
+        prev_post,
+        fn,
+        hc_scale,
+        hc_base,
+        magnitude=magnitude,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        norm_weight=norm_weight,
+        layernorm_eps=layernorm_eps,
+    )
+
+
+@_ihc_post_pre_op.register_fake
+def _ihc_post_pre_op_fake(
+    x,
+    residual,
+    prev_post,
+    fn,
+    hc_scale,
+    hc_base,
+    norm_weight,
+    magnitude,
+    hc_eps,
+    norm_eps,
+    layernorm_eps,
+):
+    outer = tuple(residual.shape[:-2])
+    hidden = int(residual.shape[-1])
+    return (
+        torch.empty_like(residual),
+        torch.empty(outer + (IHC_MULT,), dtype=torch.float32, device=residual.device),
+        torch.empty(outer + (hidden,), dtype=torch.bfloat16, device=residual.device),
+    )
 
 
 @torch.library.custom_op("b12x::ihc_head", mutates_args=())
@@ -691,6 +1451,133 @@ def _ihc_head_op_fake(streams, fn, hc_head_scale, hc_head_base, hc_eps, norm_eps
     return torch.empty(outer + (hidden,), dtype=torch.bfloat16, device=streams.device)
 
 
+_IHC_BOUND_FIELDS = ("out_streams", "post_buffer", "y")
+
+
+@torch.library.custom_op("b12x::ihc_bound", mutates_args=("buffers",))
+def _ihc_bound_op(
+    inputs: list[torch.Tensor],
+    buffers: list[torch.Tensor],
+    norm_weight: torch.Tensor | None,
+    operation: str,
+    plan_handle: int,
+    magnitude: float,
+    hc_eps: float,
+    norm_eps: float,
+    layernorm_eps: float,
+) -> None:
+    plan = plan_from_handle(plan_handle)
+    state = _prepared_state(plan)
+    live = state.caps.max_tokens
+    for candidate in inputs:
+        if candidate.ndim >= 2 and tuple(candidate.shape[-2:])[-1] == state.caps.hidden_size:
+            live = int(candidate.shape[0])
+            break
+    binding = B12XIHCBinding(
+        state=state,
+        plan=plan,
+        tokens=live,
+        **{
+            name: value[:live] if value.numel() else None
+            for name, value in zip(_IHC_BOUND_FIELDS, buffers, strict=True)
+        },
+    )
+    if operation == "pre":
+        _ihc_pre_impl(
+            *inputs,
+            magnitude=magnitude,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            norm_weight=norm_weight,
+            layernorm_eps=layernorm_eps,
+            binding=binding,
+            _state=state,
+        )
+    elif operation == "post":
+        _ihc_post_impl(*inputs, binding=binding, _state=state)
+    elif operation == "post_pre":
+        _ihc_post_pre_impl(
+            *inputs,
+            magnitude=magnitude,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            norm_weight=norm_weight,
+            layernorm_eps=layernorm_eps,
+            binding=binding,
+            _state=state,
+        )
+    elif operation == "head":
+        _ihc_head_impl(
+            *inputs,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            binding=binding,
+            _state=state,
+        )
+    else:
+        raise ValueError("bound iHC requires pre, post, post_pre, or head")
+
+
+@_ihc_bound_op.register_fake
+def _ihc_bound_op_fake(
+    inputs, buffers, norm_weight, operation, plan_handle, magnitude, hc_eps, norm_eps, layernorm_eps
+):
+    pass
+
+
+def _run_bound(
+    binding: B12XIHCBinding,
+    *,
+    operation: str,
+    inputs: list[torch.Tensor],
+    norm_weight: torch.Tensor | None,
+    magnitude: float,
+    hc_eps: float,
+    norm_eps: float,
+    layernorm_eps: float,
+):
+    if binding.plan is None:
+        raise ValueError("bound iHC execution requires a plan on the binding")
+    required = {
+        "pre": ("post_buffer", "y"),
+        "post": ("out_streams",),
+        "post_pre": ("out_streams", "post_buffer", "y"),
+        "head": ("y",),
+    }[operation]
+    missing = [name for name in required if getattr(binding, name) is None]
+    if missing:
+        raise ValueError(
+            "bound iHC execution requires the "
+            + ", ".join(missing)
+            + " buffer(s) on the binding"
+        )
+    device = binding.state.caps.device
+    buffers = [
+        getattr(binding, name)
+        if getattr(binding, name) is not None
+        else torch.empty(0, dtype=torch.bfloat16, device=device)
+        for name in _IHC_BOUND_FIELDS
+    ]
+    torch.ops.b12x.ihc_bound(
+        inputs,
+        buffers,
+        norm_weight,
+        operation,
+        binding.plan.handle,
+        float(magnitude),
+        float(hc_eps),
+        float(norm_eps),
+        float(layernorm_eps),
+    )
+    tokens = binding.tokens
+    return tuple(
+        value[:tokens]
+        if value.numel() and value.shape[0] != tokens
+        else value
+        for value in buffers
+    )
+
+
 def run_pre(
     streams: torch.Tensor,
     fn: torch.Tensor,
@@ -700,27 +1587,69 @@ def run_pre(
     magnitude: float = IHC_DEFAULT_MAGNITUDE,
     hc_eps: float = IHC_DEFAULT_HC_EPS,
     norm_eps: float = IHC_DEFAULT_NORM_EPS,
+    norm_weight: torch.Tensor | None = None,
+    layernorm_eps: float = IHC_DEFAULT_NORM_EPS,
     out_post: torch.Tensor | None = None,
     out_y: torch.Tensor | None = None,
+    plan: Plan | None = None,
+    binding: B12XIHCBinding | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Collapse the streams into the sublayer input and emit the post gates.
 
     ``(post, y)``: FP32 post gates ``[..., 4]`` and BF16 collapsed sublayer input
     ``[..., H]`` (same order as transformers ``HYV4HyperConnection.forward``;
     vLLM's ``HYV4HCPreLayer`` returns the reverse order). ``fn`` is the iHC
-    8-row FP32 ``[8, 4H]`` weight (4 pre + 4 post rows). See the module
-    docstring for the exact numerics; ``out_post`` / ``out_y`` accept
-    caller-owned destinations outside ``torch.compile``.
+    8-row FP32 ``[8, 4H]`` weight (4 pre + 4 post rows). With ``norm_weight``
+    the sublayer input RMSNorm is folded into the same launch and ``y`` is the
+    normalized sublayer input. See the module docstring for the exact numerics.
+    ``out_post`` / ``out_y`` accept caller-owned destinations outside
+    ``torch.compile``; ``plan`` / ``binding`` route through a prepared
+    ``plan_ihc`` state.
     """
+    if binding is not None:
+        if out_post is not None or out_y is not None:
+            raise ValueError(
+                "iHC binding owns output buffers; do not also pass out_post/out_y"
+            )
+        out_streams, post, y = _run_bound(
+            binding,
+            operation="pre",
+            inputs=[streams, fn, hc_scale, hc_base],
+            norm_weight=norm_weight,
+            magnitude=magnitude,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            layernorm_eps=layernorm_eps,
+        )
+        return post, y
+    if plan is not None:
+        if torch.compiler.is_compiling():
+            raise RuntimeError("planned iHC is not supported inside Dynamo")
+        return _ihc_pre_impl(
+            streams,
+            fn,
+            hc_scale,
+            hc_base,
+            magnitude=magnitude,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            norm_weight=norm_weight,
+            layernorm_eps=layernorm_eps,
+            out_post=out_post,
+            out_y=out_y,
+            _state=_prepared_state(plan),
+        )
     if out_post is None and out_y is None:
         return torch.ops.b12x.ihc_pre(
             streams,
             fn,
             hc_scale,
             hc_base,
+            norm_weight,
             float(magnitude),
             float(hc_eps),
             float(norm_eps),
+            float(layernorm_eps),
         )
     if torch.compiler.is_compiling():
         raise RuntimeError("caller-owned iHC buffers are not supported inside Dynamo")
@@ -732,6 +1661,8 @@ def run_pre(
         magnitude=magnitude,
         hc_eps=hc_eps,
         norm_eps=norm_eps,
+        norm_weight=norm_weight,
+        layernorm_eps=layernorm_eps,
         out_post=out_post,
         out_y=out_y,
     )
@@ -743,6 +1674,8 @@ def run_post(
     post: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
+    plan: Plan | None = None,
+    binding: B12XIHCBinding | None = None,
 ) -> torch.Tensor:
     """Redistribute the sublayer output: ``out[i] = post_i * x + residual[i]``.
 
@@ -751,11 +1684,129 @@ def run_post(
     """
     if post.ndim == residual.ndim and post.shape[-1] == 1:
         post = post.squeeze(-1)
+    if binding is not None:
+        if out is not None:
+            raise ValueError("iHC binding owns output buffers; do not also pass out")
+        (out_view, _, _) = _run_bound(
+            binding,
+            operation="post",
+            inputs=[x, residual, post],
+            norm_weight=None,
+            magnitude=IHC_DEFAULT_MAGNITUDE,
+            hc_eps=IHC_DEFAULT_HC_EPS,
+            norm_eps=IHC_DEFAULT_NORM_EPS,
+            layernorm_eps=IHC_DEFAULT_NORM_EPS,
+        )
+        return out_view
+    if plan is not None:
+        if torch.compiler.is_compiling():
+            raise RuntimeError("planned iHC is not supported inside Dynamo")
+        return _ihc_post_impl(x, residual, post, out=out, _state=_prepared_state(plan))
     if out is None:
         return torch.ops.b12x.ihc_post(x, residual, post)
     if torch.compiler.is_compiling():
         raise RuntimeError("caller-owned iHC buffers are not supported inside Dynamo")
     return _ihc_post_impl(x, residual, post, out=out)
+
+
+def run_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    prev_post: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    magnitude: float = IHC_DEFAULT_MAGNITUDE,
+    hc_eps: float = IHC_DEFAULT_HC_EPS,
+    norm_eps: float = IHC_DEFAULT_NORM_EPS,
+    norm_weight: torch.Tensor | None = None,
+    layernorm_eps: float = IHC_DEFAULT_NORM_EPS,
+    out_streams: torch.Tensor | None = None,
+    out_post: torch.Tensor | None = None,
+    out_y: torch.Tensor | None = None,
+    plan: Plan | None = None,
+    binding: B12XIHCBinding | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The sublayer boundary in ONE launch: post update + next pre (+ RMSNorm).
+
+    ``(out_streams, post, y)``: the updated BF16 streams ``[..., 4, H]``, the
+    next FP32 post gates ``[..., 4]``, and the next BF16 sublayer input
+    ``[..., H]`` (RMSNorm-folded when ``norm_weight`` is given). Equivalent to
+    ``run_post`` followed by ``run_pre`` — including the single BF16 rounding of
+    the updated streams feeding the gates — at three-launch cost.
+    """
+    if prev_post.ndim == residual.ndim and prev_post.shape[-1] == 1:
+        prev_post = prev_post.squeeze(-1)
+    if binding is not None:
+        if out_streams is not None or out_post is not None or out_y is not None:
+            raise ValueError(
+                "iHC binding owns output buffers; do not also pass out_streams/"
+                "out_post/out_y"
+            )
+        out_view, post_view, y_view = _run_bound(
+            binding,
+            operation="post_pre",
+            inputs=[x, residual, prev_post, fn, hc_scale, hc_base],
+            norm_weight=norm_weight,
+            magnitude=magnitude,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            layernorm_eps=layernorm_eps,
+        )
+        return out_view, post_view, y_view
+    if plan is not None:
+        if torch.compiler.is_compiling():
+            raise RuntimeError("planned iHC is not supported inside Dynamo")
+        return _ihc_post_pre_impl(
+            x,
+            residual,
+            prev_post,
+            fn,
+            hc_scale,
+            hc_base,
+            magnitude=magnitude,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            norm_weight=norm_weight,
+            layernorm_eps=layernorm_eps,
+            out_streams=out_streams,
+            out_post=out_post,
+            out_y=out_y,
+            _state=_prepared_state(plan),
+        )
+    if out_streams is None and out_post is None and out_y is None:
+        return torch.ops.b12x.ihc_post_pre(
+            x,
+            residual,
+            prev_post,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            float(magnitude),
+            float(hc_eps),
+            float(norm_eps),
+            float(layernorm_eps),
+        )
+    if torch.compiler.is_compiling():
+        raise RuntimeError("caller-owned iHC buffers are not supported inside Dynamo")
+    return _ihc_post_pre_impl(
+        x,
+        residual,
+        prev_post,
+        fn,
+        hc_scale,
+        hc_base,
+        magnitude=magnitude,
+        hc_eps=hc_eps,
+        norm_eps=norm_eps,
+        norm_weight=norm_weight,
+        layernorm_eps=layernorm_eps,
+        out_streams=out_streams,
+        out_post=out_post,
+        out_y=out_y,
+    )
 
 
 def run_head(
@@ -767,8 +1818,37 @@ def run_head(
     hc_eps: float = IHC_DEFAULT_HC_EPS,
     norm_eps: float = IHC_DEFAULT_NORM_EPS,
     out: torch.Tensor | None = None,
+    plan: Plan | None = None,
+    binding: B12XIHCBinding | None = None,
 ) -> torch.Tensor:
     """Final stream merge before the output norm (``HYV4HyperHead``)."""
+    if binding is not None:
+        if out is not None:
+            raise ValueError("iHC binding owns output buffers; do not also pass out")
+        (_, _, y_view) = _run_bound(
+            binding,
+            operation="head",
+            inputs=[streams, fn, hc_head_scale, hc_head_base],
+            norm_weight=None,
+            magnitude=IHC_DEFAULT_MAGNITUDE,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            layernorm_eps=IHC_DEFAULT_NORM_EPS,
+        )
+        return y_view
+    if plan is not None:
+        if torch.compiler.is_compiling():
+            raise RuntimeError("planned iHC is not supported inside Dynamo")
+        return _ihc_head_impl(
+            streams,
+            fn,
+            hc_head_scale,
+            hc_head_base,
+            hc_eps=hc_eps,
+            norm_eps=norm_eps,
+            out=out,
+            _state=_prepared_state(plan),
+        )
     if out is None:
         return torch.ops.b12x.ihc_head(
             streams, fn, hc_head_scale, hc_head_base, float(hc_eps), float(norm_eps)
