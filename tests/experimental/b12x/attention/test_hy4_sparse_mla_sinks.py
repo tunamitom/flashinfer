@@ -44,7 +44,28 @@ CACHE_TOKENS = 2304  # > topk so selection is genuinely sparse
 PAGE_SIZE = 64
 
 
-def _make_case(*, rows: int, heads: int, width: int = TOPK, seed: int = 20261114):
+def _make_case(
+    *,
+    rows: int,
+    heads: int,
+    width: int = TOPK,
+    live: int | None = None,
+    qscale: float = 1.0,
+    seed: int = 20261114,
+):
+    """One sparse-selection case.
+
+    ``width`` is the top-k slot count the kernel plans for; ``live`` is how
+    many of those slots hold real selections per row (the rest are ``-1``
+    padding AND the row's ``nsa_cache_seqlens`` live count is ``live`` — the
+    realistic ragged-selection shape: a row whose whole cache selection is
+    narrower than its top-k).  ``qscale`` scales the query magnitudes (and
+    hence the score spread), keeping the row LSE pinned near ``log(live)``.
+    """
+    if live is None:
+        live = width
+    if not 0 < live <= width:
+        raise ValueError(f"live must be in (0, {width}], got {live}")
     torch.manual_seed(seed)
     device = "cuda"
     k_nope = (
@@ -54,17 +75,19 @@ def _make_case(*, rows: int, heads: int, width: int = TOPK, seed: int = 20261114
         torch.randn(CACHE_TOKENS, ROPE_DIM, device=device, dtype=torch.bfloat16) / 4
     )
     kv_cache = pack_mla_kv_cache_reference(k_nope, k_rope)
-    q_all = torch.randn(rows, heads, HEAD_DIM, device=device, dtype=torch.bfloat16) / 4
-    selected = torch.stack(
-        [
-            torch.randperm(CACHE_TOKENS, device=device)[:width].sort().values
-            for _ in range(rows)
-        ]
-    ).to(torch.int32)
+    q_all = (
+        torch.randn(rows, heads, HEAD_DIM, device=device, dtype=torch.bfloat16)
+        / 4
+        * qscale
+    )
+    selected = torch.full((rows, width), -1, dtype=torch.int32, device=device)
+    for row in range(rows):
+        picks = torch.randperm(CACHE_TOKENS, device=device)[:live].sort().values
+        selected[row, :live] = picks.to(torch.int32)
     cache_seqlens = torch.full(
         (rows,), CACHE_TOKENS, dtype=torch.int32, device=device
     )
-    active = torch.full((rows,), width, dtype=torch.int32, device=device)
+    active = torch.full((rows,), live, dtype=torch.int32, device=device)
     return q_all, kv_cache, selected, cache_seqlens, active
 
 
@@ -190,6 +213,54 @@ def _reference(q_all, kv_cache, selected, active, sink):
     return ref_out, ref_lse2
 
 
+def _softmax_sink_column_truth(
+    q_all, kv_cache, selected, active, sink, *, sm_scale=None, v_head_dim=V_HEAD_DIM
+):
+    """Independent ground truth: ONE softmax over [scores | sink column].
+
+    Built directly from the dequantized cache records — the sink enters as a
+    real extra softmax column (the decode-epilogue semantics), NOT via the
+    sigmoid/logaddexp fold formula the kernels use.  Returns the output and
+    the base-2 LSE of the WITH-sink softmax.
+    """
+    from b12x.attention._shared.mla.reference import unpack_mla_kv_cache_reference
+
+    if sm_scale is None:
+        sm_scale = HEAD_DIM**-0.5
+    kv = unpack_mla_kv_cache_reference(kv_cache).squeeze(1).to(torch.float64)
+    rows, heads, _ = q_all.shape
+    sink64 = (
+        None if sink is None else sink.to(torch.float64).reshape(-1)
+    )
+    outs = torch.zeros(
+        rows, heads, v_head_dim, dtype=torch.float64, device=q_all.device
+    )
+    lses2 = torch.full(
+        (rows, heads), -float("inf"), dtype=torch.float64, device=q_all.device
+    )
+    for row in range(rows):
+        sel = selected[row].to(torch.long)
+        end = int(active[row].item()) if active is not None else int(sel.numel())
+        sel = sel[:end]
+        sel = sel[(sel >= 0) & (sel < kv.shape[0])]
+        if int(sel.numel()) == 0:
+            continue
+        k_sel = kv.index_select(0, sel)  # [k, 576]
+        scores = (
+            torch.einsum("hd,kd->hk", q_all[row].to(torch.float64), k_sel) * sm_scale
+        )
+        total = (
+            scores
+            if sink64 is None
+            else torch.cat([scores, sink64[:, None]], dim=1)  # the sink COLUMN
+        )
+        lse_e = torch.logsumexp(total, dim=1)
+        probs = torch.exp(scores - lse_e[:, None])
+        outs[row] = probs @ k_sel[:, :v_head_dim]
+        lses2[row] = lse_e / LN2
+    return outs, lses2
+
+
 def _assert_close(actual, expected, *, what: str):
     torch.cuda.synchronize()
     assert bool(torch.isfinite(actual).all().item()), f"{what}: non-finite output"
@@ -199,8 +270,16 @@ def _assert_close(actual, expected, *, what: str):
         actual_f.reshape(-1), expected_f.reshape(-1), dim=0
     )
     assert float(cosine.item()) > 0.999, f"{what}: cosine {float(cosine.item()):.6f}"
+    # Tolerances scaled to the OUTPUT MAGNITUDE (defect 14: the old flat
+    # rtol/atol=5e-2 was several times the whole output scale and could not
+    # fail; measured kernel-vs-reference margins are ~0.6% of scale).
+    out_scale = float(expected_f.abs().max())
     torch.testing.assert_close(
-        actual_f, expected_f, rtol=5e-2, atol=5e-2, msg=lambda m: f"{what}: {m}"
+        actual_f,
+        expected_f,
+        rtol=2e-2,
+        atol=2e-2 * max(out_scale, 1e-6),
+        msg=lambda m: f"{what}: {m}",
     )
 
 
@@ -208,11 +287,12 @@ def _assert_lse_close(actual_lse2, expected_lse2, *, what: str):
     # Base-2 LSE; only compare rows with live selection.
     live = expected_lse2.isfinite()
     assert bool(live.any().item()), f"{what}: no live rows"
+    lse_scale = float(expected_lse2[live].float().abs().max())
     torch.testing.assert_close(
         actual_lse2[live].float(),
         expected_lse2[live].float(),
         rtol=0.0,
-        atol=0.05,
+        atol=max(5e-3, 2e-3 * lse_scale),
         msg=lambda m: f"{what}: {m}",
     )
 
@@ -229,9 +309,10 @@ def _assert_sink_visible(off_lse2: torch.Tensor, sink: torch.Tensor, *, what: st
 
 
 @pytest.mark.parametrize("mode", ["extend", "verify"])
-def test_glm_nsa_topk2048_sink_folds_like_decode(mode: str) -> None:
+@pytest.mark.parametrize("heads", [8, 16])  # Hy4 runs 16-head groups (defect 14)
+def test_glm_nsa_topk2048_sink_folds_like_decode(mode: str, heads: int) -> None:
     require_b12x()
-    rows, heads = 2, 8
+    rows = 2
     q, kv, sel, lens, active = _make_case(rows=rows, heads=heads)
     sink = _sink_logits(heads, seed=7)
 
@@ -241,11 +322,16 @@ def test_glm_nsa_topk2048_sink_folds_like_decode(mode: str) -> None:
     _assert_sink_visible(off_lse, sink, what=mode)
     _assert_close(out, ref_out, what=f"{mode}-with-sink")
     _assert_lse_close(lse, ref_lse, what=f"{mode}-with-sink-lse")
+    # Cross-check against the independent softmax-with-sink-column truth.
+    truth_out, truth_lse2 = _softmax_sink_column_truth(q, kv, sel, active, sink)
+    _assert_close(out, truth_out.to(torch.bfloat16), what=f"{mode}-softmax-truth")
+    _assert_lse_close(lse, truth_lse2, what=f"{mode}-softmax-truth-lse")
 
 
-def test_decode_topk2048_sink_folds_like_decode() -> None:
+@pytest.mark.parametrize("heads", [8, 16])
+def test_decode_topk2048_sink_folds_like_decode(heads: int) -> None:
     require_b12x()
-    rows, heads = 2, 8
+    rows = 2
     q, kv, sel, lens, active = _make_case(rows=rows, heads=heads)
     sink = _sink_logits(heads, seed=7)
 
@@ -255,6 +341,9 @@ def test_decode_topk2048_sink_folds_like_decode() -> None:
     _assert_sink_visible(off_lse, sink, what="decode")
     _assert_close(out, ref_out, what="decode-with-sink")
     _assert_lse_close(lse, ref_lse, what="decode-with-sink-lse")
+    truth_out, truth_lse2 = _softmax_sink_column_truth(q, kv, sel, active, sink)
+    _assert_close(out, truth_out.to(torch.bfloat16), what="decode-softmax-truth")
+    _assert_lse_close(lse, truth_lse2, what="decode-softmax-truth-lse")
 
 
 @pytest.mark.parametrize("mode", ["decode", "extend"])
@@ -475,3 +564,72 @@ def test_cp_provenance_rejects_plan_sink_plus_merge_sink() -> None:
     )
     assert merged.shape == (2, heads // 2, 8)
     assert merged_lse.shape == (2, heads // 2)
+
+
+# ──────────── defect 14: realistic sinks (<= 3.2) vs comparable LSE ─────────
+
+
+@pytest.mark.parametrize("mode", ["decode", "extend", "verify"])
+def test_realistic_sink_regime_16_head_matches_softmax_column(mode: str) -> None:
+    """Sinks <= 3.2 against a COMPARABLE row LSE, 16-head groups (defect 14).
+
+    Hy4's trained sink logits are small (<= 3.2); the earlier tests inflated
+    the sinks to 6..10 to reach visibility at top-k 2048 (row LSE ~7.6 nats).
+    With a narrow live selection the row LSE sits in the same band as the
+    realistic sinks, so the fold is real work on every head.  Ground truth is
+    the softmax with a sink column (not the fold formula) and the tolerances
+    are scaled to the output magnitude.
+
+    The extend/verify runs exercise the MG prefill kernel, whose GLM_NSA topk
+    must be one of {512, 1024, 2048} — the earlier ``width=16`` case planned
+    an unsupported shape.  They run the legal 512-wide topk over a narrow
+    LIVE selection (32 real entries, ``-1`` padding, live count 32) with the
+    queries scaled x0.1: the row LSE then pins to log(32) = 3.47 nats — inside
+    the sinks' band on every head.  A 512-live row can never be comparable:
+    its LSE is at least log(512) = 6.24 nats, where every sink <= 3.2 folds
+    with a factor >= 0.95 — the numerically-invisible regime the sink tests
+    must not sit in.
+    """
+    require_b12x()
+    rows, heads = 2, 16
+    if mode == "decode":
+        width, live, qscale = 16, 16, 1.0
+    else:
+        width, live, qscale = 512, 32, 0.1
+    q, kv, sel, lens, active = _make_case(
+        rows=rows, heads=heads, width=width, live=live, qscale=qscale
+    )
+    torch.manual_seed(5)
+    sink = torch.linspace(1.2, 3.2, heads, device="cuda")
+    assert float(sink.max()) <= 3.2 + 1e-5  # fp32 linspace endpoint
+
+    _, nosink_lse2 = _softmax_sink_column_truth(q, kv, sel, active, sink=None)
+    factor = torch.sigmoid(nosink_lse2.double() * LN2 - sink.double().unsqueeze(0))
+    assert bool(((factor > 0.05) & (factor < 0.95)).all().item()), (
+        f"realistic-sink regime is degenerate for {mode}: factors "
+        f"{factor.float().flatten()[:8]} (row LSE must be comparable to the sink)"
+    )
+
+    out, lse = _run_public(q, kv, sel, lens, active, mode=mode, sink=sink, width=width)
+    _, off_lse = _run_public(
+        q, kv, sel, lens, active, mode=mode, sink=None, width=width
+    )
+    truth_out, truth_lse2 = _softmax_sink_column_truth(q, kv, sel, active, sink)
+    _assert_close(
+        out, truth_out.to(torch.bfloat16), what=f"{mode}-realistic-softmax-truth"
+    )
+    _assert_lse_close(
+        lse, truth_lse2, what=f"{mode}-realistic-softmax-truth-lse"
+    )
+    # The fold must be visible: sink-on differs from sink-off everywhere it
+    # matters and moves the LSE toward the sink band.
+    live = off_lse.isfinite()
+    assert not torch.allclose(
+        lse[live].float(), off_lse[live].float(), atol=0.2, rtol=0.0
+    ), f"{mode}: realistic sink does not move the LSE"
+    assert not torch.allclose(
+        out.float(),
+        _run_public(q, kv, sel, lens, active, mode=mode, sink=None, width=width)[0].float(),
+        rtol=1e-2,
+        atol=1e-3,
+    ), f"{mode}: realistic sink does not move the output"
