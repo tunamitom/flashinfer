@@ -1,0 +1,131 @@
+{
+  "op": "b12x.norm.mhc.ihc",
+  "hidden": 6144,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+  "torch": "2.14.1+cu132",
+  "triton": "3.8.0",
+  "date": "2026-11-14",
+  "units": "ms per call (median of rounds of batched iterations)",
+  "results": [
+    {
+      "rows": 1,
+      "hidden": 6144,
+      "eager": {
+        "pre": 0.06550240039825439,
+        "post": 0.013752319812774659,
+        "pre_norm_fold": 0.0697318410873413,
+        "boundary_three_launch": 0.07091199874877929,
+        "boundary_fused": 0.07233759880065918,
+        "head": 0.03782783985137939
+      },
+      "device": {
+        "pre": 0.06654143810272217,
+        "post": 0.0027423998713493347,
+        "pre_norm_fold": 0.0710099220275879,
+        "boundary_three_launch": 0.07174816131591796,
+        "boundary_fused": 0.07370783805847168,
+        "head": 0.038928000926971434
+      }
+    },
+    {
+      "rows": 2,
+      "hidden": 6144,
+      "eager": {
+        "pre": 0.06558112144470214,
+        "post": 0.013517440557479858,
+        "pre_norm_fold": 0.06981120109558106,
+        "boundary_three_launch": 0.07097983837127686,
+        "boundary_fused": 0.07237184047698975,
+        "head": 0.037794880867004395
+      },
+      "device": {
+        "pre": 0.06680223941802979,
+        "post": 0.0019974400103092193,
+        "pre_norm_fold": 0.07157567977905273,
+        "boundary_three_launch": 0.07171072006225586,
+        "boundary_fused": 0.07372416019439697,
+        "head": 0.038910400867462155
+      }
+    },
+    {
+      "rows": 4,
+      "hidden": 6144,
+      "eager": {
+        "pre": 0.06796031951904297,
+        "post": 0.013036160469055176,
+        "pre_norm_fold": 0.07236800193786622,
+        "boundary_three_launch": 0.07360191822052002,
+        "boundary_fused": 0.07495840072631836,
+        "head": 0.03920768022537231
+      },
+      "device": {
+        "pre": 0.06960991859436035,
+        "post": 0.0019913600385189057,
+        "pre_norm_fold": 0.07372288227081299,
+        "boundary_three_launch": 0.0742959976196289,
+        "boundary_fused": 0.07579552173614502,
+        "head": 0.04095808029174805
+      }
+    },
+    {
+      "rows": 8,
+      "hidden": 6144,
+      "eager": {
+        "pre": 0.06831103801727295,
+        "post": 0.012995840311050414,
+        "pre_norm_fold": 0.07272128105163574,
+        "boundary_three_launch": 0.07395296096801758,
+        "boundary_fused": 0.07527359962463379,
+        "head": 0.0394054388999939
+      },
+      "device": {
+        "pre": 0.06961023807525635,
+        "post": 0.0020604799687862396,
+        "pre_norm_fold": 0.07376192092895507,
+        "boundary_three_launch": 0.07575104236602784,
+        "boundary_fused": 0.07580927848815917,
+        "head": 0.0409606409072876
+      }
+    },
+    {
+      "rows": 16,
+      "hidden": 6144,
+      "eager": {
+        "pre": 0.06845344066619873,
+        "post": 0.013021759986877442,
+        "pre_norm_fold": 0.07291679859161376,
+        "boundary_three_launch": 0.07424992084503174,
+        "boundary_fused": 0.07544127941131591,
+        "head": 0.03950144052505493
+      },
+      "device": {
+        "pre": 0.06965504169464111,
+        "post": 0.0020105600357055663,
+        "pre_norm_fold": 0.07376383781433106,
+        "boundary_three_launch": 0.07575679779052734,
+        "boundary_fused": 0.07590303897857666,
+        "head": 0.04095808029174805
+      }
+    },
+    {
+      "rows": 4096,
+      "hidden": 6144,
+      "eager": {
+        "pre": 0.5050464153289795,
+        "post": 0.25545759201049806,
+        "pre_norm_fold": 0.5899119853973389,
+        "boundary_three_launch": 0.8416687965393066,
+        "boundary_fused": 0.7177423954010009,
+        "head": 0.32888638973236084
+      },
+      "device": {
+        "pre": 0.5378384113311767,
+        "post": 0.2553247928619385,
+        "pre_norm_fold": 0.6095615863800049,
+        "boundary_three_launch": 0.8502799987792968,
+        "boundary_fused": 0.7194960117340088,
+        "head": 0.3294703960418701
+      }
+    }
+  ]
+}
