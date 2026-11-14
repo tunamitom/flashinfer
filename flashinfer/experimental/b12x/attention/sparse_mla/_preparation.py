@@ -385,11 +385,14 @@ class _WriterState:
     slot_mapping: torch.Tensor
     compiled: object
     nvfp4: bool
+    record_bytes: int
 
     def run(self, kv_c, kv_cache, slot_mapping):
         from b12x.attention._shared.mla import kv_cache as writer
 
         writer._validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
+        if int(kv_cache.shape[-1]) != int(self.record_bytes):
+            raise ValueError("cache-writer record format differs from preparation")
         if (int(kv_cache.shape[-1]) == 304) != self.nvfp4:
             raise ValueError("cache-writer record format differs from preparation")
         if int(kv_cache.shape[1]) != int(self.kv_cache.shape[1]):
@@ -415,7 +418,13 @@ def plan_cache_writer(
     invocation: FrozenMapping = FrozenMapping(),
     override: SparseMlaConfig | None = None,
 ) -> Plan:
-    """Declare the exact GLM_NEXT paged cache-writer specialization."""
+    """Declare the exact paged cache-writer specialization.
+
+    Supports the GLM_NEXT 528-byte FP8 record, the GLM_NEXT 304-byte NVFP4
+    record, and the GLM_NSA 656-byte fused record (528-byte prefix plus the
+    raw BF16 RoPE tail; ``kv_c`` 576 wide) — the record format is encoded by
+    the cache width and ``kv_c`` width.
+    """
     from b12x.attention._shared.mla import kv_cache as writer
 
     writer._validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
@@ -470,7 +479,9 @@ def plan_cache_writer(
             compiled = writer._compile_glm_next_mla_cache_writer(
                 kv_c, kv_cache, slot_mapping
             )
-        return _WriterState(kv_cache, slot_mapping, compiled, record_bytes == 304)
+        return _WriterState(
+            kv_cache, slot_mapping, compiled, record_bytes == 304, record_bytes
+        )
 
     return Plan(
         contract=TUNING,

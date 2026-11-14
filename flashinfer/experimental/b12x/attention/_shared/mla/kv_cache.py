@@ -141,8 +141,20 @@ _GLM_NEXT_SCALE_OFFSET = _GLM_NEXT_LATENT_DIM
 _GLM_NEXT_RECORD_BYTES = _GLM_NEXT_LATENT_DIM + _GLM_NEXT_NUM_GROUPS * 4
 _GLM_NEXT_NVFP4_RECORD_BYTES = 304
 _GLM_NEXT_E4M3_MAX_RCP = 1.0 / 448.0
+# GLM_NSA (ARBITRARY_FP32) fused record: the GLM_NEXT 528B nope+scale prefix
+# followed by a raw BF16 RoPE tail (64 dims / 128 bytes at offset 528) — the
+# 656B record the GLM_NSA sparse-MLA readers consume (traits:
+# kv_gmem_stride == 656, rope_gmem_offset == 528; authoritative layout
+# ``reference.pack_mla_kv_cache_reference``).  ``kv_c`` for this mode is the
+# decoded latent row ``(num_tokens, 576)``: 512 no-RoPE dims quantized into the
+# record prefix plus 64 RoPE dims copied verbatim.
+_GLM_NEXT_ROPE_DIM = 64
+_GLM_NEXT_ROPE_BYTES = _GLM_NEXT_ROPE_DIM * 2  # 128 raw BF16 bytes
+_GLM_NEXT_ROPE_OFFSET = _GLM_NEXT_RECORD_BYTES  # 528
+_GLM_NSA_LATENT_DIM = _GLM_NEXT_LATENT_DIM + _GLM_NEXT_ROPE_DIM  # 576
+_GLM_NSA_RECORD_BYTES = _GLM_NEXT_RECORD_BYTES + _GLM_NEXT_ROPE_BYTES  # 656
 _GLM_NEXT_WRITER_LOCK = RLock()
-_GLM_NEXT_WRITER_COMPILED: dict[tuple[int, int, torch.dtype], object] = {}
+_GLM_NEXT_WRITER_COMPILED: dict[tuple[int, int, torch.dtype, int], object] = {}
 _NVFP4_WRITER_COMPILED: dict[
     tuple[int, int, torch.dtype, torch.dtype, bool, bool], object
 ] = {}
@@ -534,9 +546,12 @@ class ConcatAndCacheGlmNextMlaKernel:
     per source token.
     """
 
-    def __init__(self, block_size: int, dsv41: bool = False):
+    def __init__(self, block_size: int, dsv41: bool = False, has_rope: bool = False):
         self.block_size = int(block_size)
         self.dsv41 = bool(dsv41)
+        # GLM_NSA fused 656B record: ``kv_c`` carries 576 dims (512 no-RoPE +
+        # 64 RoPE) and the raw BF16 RoPE tail lands at record offset 528.
+        self.has_rope = bool(has_rope)
         self.snapshot_tokens = 0
         self.group_size = 32 if dsv41 else _GLM_NEXT_GROUP_SIZE
         self.lanes_per_group = self.group_size // 4
@@ -544,8 +559,8 @@ class ConcatAndCacheGlmNextMlaKernel:
     @cute.jit
     def __call__(
         self,
-        kv_c: cute.Tensor,  # (num_tokens, 512) bf16
-        kv_cache: cute.Tensor,  # (num_blocks, block_size, 528) u8
+        kv_c: cute.Tensor,  # (num_tokens, 512|576) bf16
+        kv_cache: cute.Tensor,  # (num_blocks, block_size, 528|656) u8
         slot_mapping: cute.Tensor,  # (num_tokens,) int32/int64
         kv_c_stride: Int64,  # kv_c.stride(0), elements
         block_stride: Int64,  # kv_cache.stride(0), bytes
@@ -695,6 +710,22 @@ class ConcatAndCacheGlmNextMlaKernel:
                         + group.to(Int64) * Int64(4),
                         scale,
                     )
+            if cutlass.const_expr(self.has_rope):
+                # GLM_NSA fused record: copy the raw BF16 RoPE tail (64 dims =
+                # 128B at record offset 528) verbatim — one u32 (two BF16
+                # lanes) per thread over the first 32 threads.
+                if tid < Int32(_GLM_NEXT_ROPE_BYTES // 4):
+                    word = Int64(tid)
+                    rope_src = get_ptr_as_int64(
+                        kv_c,
+                        token64 * kv_c_stride
+                        + Int64(_GLM_NEXT_LATENT_DIM)
+                        + word * Int64(2),
+                    )
+                    st_global_u32(
+                        dst + Int64(_GLM_NEXT_ROPE_OFFSET) + word * Int64(4),
+                        _ld_global_u32(rope_src),
+                    )
 
 
 class SnapshotAndCacheDsv41SwaKernel(ConcatAndCacheGlmNextMlaKernel):
@@ -806,8 +837,9 @@ def clear_nvfp4_mla_fp8_rope_kv_cache_kernel_cache() -> None:
 @lru_cache(maxsize=None)
 def _build_concat_and_cache_glm_next_mla_kernel(
     block_size: int,
+    has_rope: bool = False,
 ) -> ConcatAndCacheGlmNextMlaKernel:
-    return ConcatAndCacheGlmNextMlaKernel(block_size)
+    return ConcatAndCacheGlmNextMlaKernel(block_size, has_rope=has_rope)
 
 
 def clear_glm_next_mla_kv_cache_kernel_cache() -> None:
@@ -877,11 +909,19 @@ def _glm_next_cache_writer_signature(
     kv_c: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
-) -> tuple[int, int, torch.dtype]:
+) -> tuple[int, int, torch.dtype, int]:
     device_index = kv_c.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    return int(device_index), int(kv_cache.shape[1]), slot_mapping.dtype
+    # The record width selects the specialization: 528 (no RoPE) and 656
+    # (GLM_NSA fused record with the BF16 RoPE tail) share the writer kernel
+    # family but not the compiled binary.
+    return (
+        int(device_index),
+        int(kv_cache.shape[1]),
+        slot_mapping.dtype,
+        int(kv_cache.shape[2]),
+    )
 
 
 def _glm_next_cache_writer_launch(
@@ -892,7 +932,9 @@ def _glm_next_cache_writer_launch(
     num_tokens = int(slot_mapping.shape[0])
     block_size = int(kv_cache.shape[1])
     slot_capacity = int(kv_cache.shape[0]) * block_size
-    kernel = _build_concat_and_cache_glm_next_mla_kernel(block_size)
+    kernel = _build_concat_and_cache_glm_next_mla_kernel(
+        block_size, has_rope=int(kv_cache.shape[2]) == _GLM_NSA_RECORD_BYTES
+    )
     args = (
         _to_kernel_tensor(kv_c, assumed_align=4, leading_dim=1),
         _to_kernel_tensor(kv_cache, assumed_align=16, leading_dim=2),
@@ -992,10 +1034,13 @@ def _validate_glm_next_mla_cache_writer_args(
     slot_mapping: torch.Tensor,
 ) -> None:
     """Validate the fixed-buffer GLM_NEXT cache-writer contract."""
-    if kv_c.ndim != 2 or int(kv_c.shape[1]) != _GLM_NEXT_LATENT_DIM:
+    if kv_c.ndim != 2 or int(kv_c.shape[1]) not in (
+        _GLM_NEXT_LATENT_DIM,
+        _GLM_NSA_LATENT_DIM,
+    ):
         raise ValueError(
             "kv_c must be (num_tokens, "
-            f"{_GLM_NEXT_LATENT_DIM}), got {tuple(kv_c.shape)}"
+            f"{_GLM_NEXT_LATENT_DIM}|{_GLM_NSA_LATENT_DIM}), got {tuple(kv_c.shape)}"
         )
     if kv_c.dtype != torch.bfloat16:
         raise TypeError(f"kv_c must be BF16, got {kv_c.dtype}")
@@ -1003,11 +1048,22 @@ def _validate_glm_next_mla_cache_writer_args(
     if kv_cache.ndim != 3 or record_bytes not in (
         _GLM_NEXT_RECORD_BYTES,
         _GLM_NEXT_NVFP4_RECORD_BYTES,
+        _GLM_NSA_RECORD_BYTES,
     ):
         raise ValueError(
             "kv_cache must be (num_pages, page_size, "
-            f"{_GLM_NEXT_RECORD_BYTES}|{_GLM_NEXT_NVFP4_RECORD_BYTES}) uint8, "
+            f"{_GLM_NEXT_RECORD_BYTES}|{_GLM_NEXT_NVFP4_RECORD_BYTES}"
+            f"|{_GLM_NSA_RECORD_BYTES}) uint8, "
             f"got {tuple(kv_cache.shape)}"
+        )
+    if (record_bytes == _GLM_NSA_RECORD_BYTES) != (
+        int(kv_c.shape[1]) == _GLM_NSA_LATENT_DIM
+    ):
+        raise ValueError(
+            "kv_c width and record format disagree: the "
+            f"{_GLM_NSA_RECORD_BYTES}-byte GLM_NSA fused record needs "
+            f"{_GLM_NSA_LATENT_DIM}-wide kv_c (512 no-RoPE + {_GLM_NEXT_ROPE_DIM} "
+            f"RoPE), got {int(kv_c.shape[1])}"
         )
     num_pages = int(kv_cache.shape[0])
     page_size = int(kv_cache.shape[1])
@@ -1067,7 +1123,14 @@ def concat_and_cache_glm_next_mla(
     *,
     plan,
 ) -> None:
-    """Write GLM_NEXT cache records through a prepared plan."""
+    """Write GLM_NEXT / GLM_NSA cache records through a prepared plan.
+
+    The record format is the cache's width: 528 (GLM_NEXT FP8 nope + inline
+    scales), 304 (GLM_NEXT NVFP4), or 656 (the GLM_NSA fused record — the
+    528-byte prefix plus the raw BF16 RoPE tail at offset 528, ``kv_c`` 576
+    wide). The writer produces exactly the fused record the sparse-MLA
+    readers consume (``traits.kv_gmem_stride``).
+    """
     from b12x.attention.sparse_mla._preparation import writer_state
 
     writer_state(plan, device=kv_cache.device).run(kv_c, kv_cache, slot_mapping)
