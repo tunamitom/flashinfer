@@ -282,6 +282,9 @@ class _DcpExecutionState:
                 call.get("out"),
                 state=self,
                 is_lse_base_on_e=call.get("is_lse_base_on_e", True),
+                attention_sink=call.get("attention_sink"),
+                lse_out=call.get("lse_out"),
+                return_lse=call.get("return_lse", False),
                 threads=call.get("threads", self.query.call["threads"]),
                 block_limit=call.get("block_limit", self.query.call["block_limit"]),
             )

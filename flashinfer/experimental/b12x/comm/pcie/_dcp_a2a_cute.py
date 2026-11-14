@@ -388,6 +388,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         local_output: cute.Pointer,
         local_lse: cute.Pointer,
         output: cute.Pointer,
+        lse_out: cute.Pointer,
         staging0: cute.Pointer,
         staging1: cute.Pointer,
         staging2: cute.Pointer,
@@ -437,6 +438,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
             local_output,
             local_lse,
             output,
+            lse_out,
             staging0,
             staging1,
             staging2,
@@ -506,6 +508,7 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
         local_output: cute.Pointer,
         local_lse: cute.Pointer,
         output: cute.Pointer,
+        lse_out: cute.Pointer,
         staging0: cute.Pointer,
         staging1: cute.Pointer,
         staging2: cute.Pointer,
@@ -740,6 +743,29 @@ class _LseReduceScatterLaunch(_DCPA2ABase):
                     weights[source_index] = weight
                     weight_sum += weight
             inv_weight_sum = Float32(1.0) / fmax_f32(weight_sum, Float32(1.0e-10))
+            # Merged LSE for this (batch, local head) row, in the launch's log
+            # base: max_lse + log(weight_sum), -inf when no rank contributed a
+            # finite LSE. Optional (lse_out may be a null pointer) so callers
+            # that need the post-merge attention-sink fold
+            # (``out *= sigmoid(lse - sink)``) can apply it exactly once after
+            # this cross-rank merge.
+            if lse_out.toint() != Int64(0) and lane == Int32(0):
+                merged_lse = Float32(float("-inf"))
+                if weight_sum > Float32(0.0):
+                    if natural_log != Int32(0):
+                        merged_lse = max_lse + cute.math.log(
+                            weight_sum, fastmath=False
+                        )
+                    else:
+                        merged_lse = max_lse + cute.math.log2(
+                            weight_sum, fastmath=True
+                        )
+                cute.arch.store(
+                    lse_out
+                    + Int64(batch_index) * Int64(heads_per_rank)
+                    + Int64(local_head),
+                    merged_lse,
+                )
 
             staging_base = source_row * Int64(packs_per_head)
             local_base = (
@@ -2113,6 +2139,7 @@ def _get_compiled_lse_reduce_scatter(
         p_u32,
         p_f32,
         p_u32,
+        p_f32,
         *(p_u8 for _ in range(_MAX_RANKS)),
         *(p_u32 for _ in range(_MAX_RANKS)),
         0,
@@ -2129,7 +2156,7 @@ def _get_compiled_lse_reduce_scatter(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.lse_reduce_scatter",
-            35,
+            36,
             key,
             labels=(
                 "world_size",
@@ -2145,6 +2172,7 @@ def _get_compiled_lse_reduce_scatter(
         local_output_ptr: int,
         local_lse_ptr: int,
         output_ptr: int,
+        lse_out_ptr: int,
         staging_ptrs: Sequence[int],
         signal_ptrs: Sequence[int],
         lse_offset: int,
@@ -2166,6 +2194,7 @@ def _get_compiled_lse_reduce_scatter(
             _u32_ptr(local_output_ptr),
             _f32_ptr(local_lse_ptr),
             _u32_ptr(output_ptr),
+            _f32_ptr(lse_out_ptr),
             *(_u8_ptr(ptr) for ptr in stages),
             *(_u32_ptr(ptr, align=4) for ptr in signals),
             int(lse_offset),
@@ -2519,6 +2548,7 @@ def lse_reduce_scatter(
     local_output_ptr: int,
     local_lse_ptr: int,
     output_ptr: int,
+    lse_out_ptr: int = 0,
     staging_ptrs: Sequence[int],
     signal_ptrs: Sequence[int],
     lse_offset: int,
@@ -2535,7 +2565,13 @@ def lse_reduce_scatter(
     blocks: int,
     launcher: Callable | None = None,
 ) -> None:
-    """Reduce attention LSE values across PCIe ranks using a prepared launcher."""
+    """Reduce attention LSE values across PCIe ranks using a prepared launcher.
+
+    ``lse_out_ptr`` optionally receives the merged (post-merge, pre-sink) LSE
+    for this rank's head shard, ``[batch, total_heads // world_size]`` FP32;
+    pass 0 to skip the store. The post-merge attention-sink fold is applied by
+    the caller (exactly once per merge).
+    """
     slot_delta_256b = _slot_delta_256b(slot_delta_bytes)
     if launcher is None:
         launcher = _get_compiled_lse_reduce_scatter(
@@ -2557,6 +2593,7 @@ def lse_reduce_scatter(
         local_output_ptr,
         local_lse_ptr,
         output_ptr,
+        lse_out_ptr,
         staging_ptrs,
         signal_ptrs,
         lse_offset,
