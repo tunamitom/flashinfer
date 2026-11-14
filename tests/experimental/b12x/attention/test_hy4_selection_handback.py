@@ -86,6 +86,65 @@ def test_rank_local_slots_maps_interleaved_ownership() -> None:
 
 
 @pytest.mark.cpu_only
+def test_per_row_slot_map_keeps_batch_rows_apart() -> None:
+    """A batch of rows needs a PER-ROW slot map (W6 D3 fix-on-the-way).
+
+    One shared rank-1 map sends every row's local indices into row zero's
+    cache slots; the rank-2 map (one row per merged row, `slot_map[i]` the row
+    `i` cache row base + its local index) keeps the rows disjoint. The
+    hand-back through the per-row map recovers each rank's entries at their
+    own row's physical slots.
+    """
+    world, rows, topk, capacity = 2, 2, 4, 8  # 4 global slots per row at world 2
+    local = capacity // world
+    row_base = [0, 16]  # row 0 at slots 0..7, row 1 at slots 16..23
+    slot_map = torch.tensor(
+        [[base + j for j in range(local)] for base in row_base], dtype=torch.int64
+    )
+    merged = torch.tensor([[0, 1, 4, 6], [2, 3, 5, -1]], dtype=torch.int32)
+    for rank in range(world):
+        got = rank_local_slots(merged, world_size=world, rank=rank, slot_map=slot_map)
+        for row in range(rows):
+            expected = []
+            for p in merged[row].tolist():
+                if p < 0 or p % world != rank:
+                    expected.append(-1)
+                else:
+                    expected.append(row_base[row] + p // world)
+            live = [v for v in expected if v >= 0]
+            got_live = [int(v) for v in got[row].tolist() if v >= 0]
+            assert got_live == live, f"rank {rank} row {row}: {got_live} != {live}"
+            # The two rows never alias: row 1's slots are outside row 0's block.
+            assert all(v < row_base[1] for v in got_live if row == 0)
+        scratch = torch.empty((rows, topk + 1), dtype=torch.int32)
+        local_sel, counts = selection_handback_reference(
+            merged,
+            world_size=world,
+            rank=rank,
+            scratch=scratch,
+            slot_map=slot_map,
+        )
+        for row in range(rows):
+            expected = [
+                row_base[row] + int(p) // world
+                for p in merged[row].tolist()
+                if p >= 0 and int(p) % world == rank
+            ]
+            got_live = [int(v) for v in local_sel[row].tolist() if v >= 0]
+            assert got_live == expected, f"hand-back rank {rank} row {row}"
+            assert int(counts[row]) == len(expected)
+    # The shared rank-1 map is the documented mutant: row 1 lands in row 0.
+    shared = rank_local_slots(
+        merged, world_size=world, rank=0, slot_map=torch.arange(local)
+    )
+    row1 = [int(v) for v in shared[1].tolist() if v >= 0]
+    assert row1 and all(v < local for v in row1)  # aliased into row 0's slots
+    # A per-row map must match the merged row count.
+    with pytest.raises(ValueError, match="per-row"):
+        rank_local_slots(merged, world_size=world, rank=0, slot_map=slot_map[:1])
+
+
+@pytest.mark.cpu_only
 def test_compact_selection_matches_naive() -> None:
     """Stable compaction to the front, -1 padding, per-row counts."""
     ids = torch.tensor(

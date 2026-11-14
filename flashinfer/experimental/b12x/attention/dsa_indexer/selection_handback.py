@@ -58,7 +58,12 @@ def rank_local_slots(
     ``p // world_size``, so interleaving spreads consecutive positions across
     ranks.  ``slot_map`` optionally maps a local index to a physical cache
     slot (paged layouts pass the page-table expansion); without it the local
-    index IS the slot.  Negative positions, positions owned by another rank
+    index IS the slot.  The map is PER ROW: rank-2 ``[rows, capacity]``
+    (``positions`` must then be rank-2 with one map row per position row) so a
+    batch of rows with distinct cache row bases maps correctly — one shared
+    rank-1 map would send every row's local indices into row zero's slots.
+    A rank-1 ``slot_map`` is still accepted and shared by every row.
+    Negative positions, positions owned by another rank
     and positions whose slot map entry is negative all become ``-1``.
     """
     if positions.dtype not in (torch.int32, torch.int64):
@@ -71,9 +76,9 @@ def rank_local_slots(
     local = torch.div(pos.clamp(min=0), world_size, rounding_mode="floor")
     live = (pos >= 0) & (pos % world_size == rank)
     if slot_map is not None:
-        if slot_map.ndim != 1:
+        if slot_map.ndim not in (1, 2):
             raise ValueError(
-                f"slot_map must be rank-1, got {tuple(slot_map.shape)}"
+                f"slot_map must be rank-1 (shared) or rank-2 (per-row), got {tuple(slot_map.shape)}"
             )
         if slot_map.dtype not in (torch.int32, torch.int64):
             raise ValueError(
@@ -81,15 +86,26 @@ def rank_local_slots(
             )
         if slot_map.device != positions.device:
             raise ValueError("slot_map must live on positions' device")
-        bounds = int(slot_map.numel())
+        if slot_map.ndim == 2:
+            if positions.ndim != 2 or slot_map.shape[0] != positions.shape[0]:
+                raise ValueError(
+                    f"per-row slot_map must have one row per merged row "
+                    f"({int(positions.shape[0]) if positions.ndim else 0}), "
+                    f"got {tuple(slot_map.shape)}"
+                )
+            table = slot_map.to(torch.int64)
+        else:
+            table = slot_map.to(torch.int64).reshape(1, -1)
+        bounds = int(table.shape[-1])
         if bounds == 0:
             return torch.full_like(pos, -1, dtype=torch.int32)
         inside = local < bounds
-        mapped = torch.where(
-            inside,
-            slot_map.to(torch.int64)[local.clamp(0, bounds - 1)],
-            torch.full_like(local, -1),
+        gathered = (
+            table[0, local.clamp(0, bounds - 1)]
+            if table.shape[0] == 1
+            else table.gather(1, local.clamp(0, bounds - 1))
         )
+        mapped = torch.where(inside, gathered, torch.full_like(local, -1))
         live = live & inside & (mapped >= 0)
         local = mapped
     return torch.where(live, local, torch.full_like(local, -1)).to(torch.int32)
@@ -185,6 +201,9 @@ class PreparedSelectionHandback:
 
     ``run`` is fixed-shape tensor arithmetic — CUDA-graph safe and
     allocation-free when the caller passes ``output``/``counts``/``scratch``.
+    ``slot_map`` is the per-row local-index -> physical-slot table
+    (``[rows, local_capacity]``; a shared rank-1 map is accepted too) — see
+    :func:`rank_local_slots`.
     """
 
     world_size: int

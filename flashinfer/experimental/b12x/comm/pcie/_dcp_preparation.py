@@ -300,6 +300,7 @@ class _DcpExecutionState:
                     what="DcpAllToAll.lse_reduce_scatter",
                 ),
                 attention_sink=call.get("attention_sink"),
+                partials_sink_folded=call.get("partials_sink_folded"),
                 lse_out=call.get("lse_out"),
                 return_lse=call.get("return_lse", False),
                 threads=call.get("threads", self.query.call["threads"]),
