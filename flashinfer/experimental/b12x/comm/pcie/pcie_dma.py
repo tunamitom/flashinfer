@@ -310,7 +310,11 @@ class PCIeDmaAllReduce:
         return inp.is_contiguous() and size_bytes <= self.max_bytes
 
     def prepare_eager_replay(
-        self, dtype: torch.dtype, *, max_elements: int | None = None
+        self,
+        dtype: torch.dtype,
+        *,
+        max_elements: int | None = None,
+        state=None,
     ) -> None:
         """Precapture bounded-capacity lossless rings for later eager calls.
 
@@ -345,6 +349,12 @@ class PCIeDmaAllReduce:
             )
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("prepare DMA eager replay before CUDA graph capture")
+        # The captured ring is the prepared execution path; the old call named a
+        # method this runtime no longer has. Callers pass a materialized state
+        # (any of this channel's prepared plans: launchers are channel-wide).
+        if state is None:
+            raise ValueError("DMA eager replay requires a prepared DMA execution state")
+        state.require_runtime(self)
         capacities = _eager_replay_capacities(
             self.max_bytes,
             self.min_bytes,
@@ -367,7 +377,7 @@ class PCIeDmaAllReduce:
                 source_view, result_view = source[:capacity], result[:capacity]
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    self._all_reduce_on_device(source_view, out=result_view)
+                    self._run_prepared(source_view, out=result_view, state=state)
                 replays.append((source_view, result_view, graph))
         self._eager_replays[dtype] = tuple(replays)
 
