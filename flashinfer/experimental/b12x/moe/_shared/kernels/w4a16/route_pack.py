@@ -376,6 +376,86 @@ def _pack_topk_routes_sort_kernel(
     tl.store(packed_route_indices + ranks, offsets, mask=valid)
 
 
+# B12X_W4A16_STABLE_ROUTE_PACK=1: place every route at its STABLE rank inside
+# its expert's segment (the order of route indices) instead of the atomic
+# arrival order of `_pack_topk_routes_sort_kernel`. The atomic order changes
+# from run to run, and with it which routes share an M-block, so identical
+# inputs did not give identical bits (Hy4 W4A16 prefill: 8-15 of 1,024 token
+# rows differed per repeat). Same arguments, same slots set, no atomics.
+
+
+def _stable_route_pack_enabled() -> bool:
+    from b12x._lib.env import env_flag
+
+    return env_flag("W4A16_STABLE_ROUTE_PACK")
+
+
+@triton.jit
+def _pack_topk_routes_stable_sort_kernel(
+    topk_ids,
+    expert_map,
+    packed_route_indices,
+    expert_offsets,
+    live_numel,
+    NUM_EXPERTS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Deterministic twin of `_pack_topk_routes_sort_kernel` (a stable counting sort).
+
+    A route's slot is its expert's segment base, plus how many routes of that
+    expert the EARLIER route blocks hold (integer histograms of those blocks —
+    order-free), plus its rank among this block's same-expert routes in route
+    order (one sort of unique keys). No atomics; `expert_offsets` stays the
+    segment bases (the atomic kernel advances it to the ends; no consumer
+    reads it afterwards)."""
+    BINS: tl.constexpr = triton.next_power_of_2(NUM_EXPERTS + 1)
+    pid = tl.program_id(0)
+    local = tl.arange(0, BLOCK_T)
+
+    before = tl.zeros((BINS,), dtype=tl.int32)
+    for block in range(0, pid):
+        others = block * BLOCK_T + local
+        other_raw = tl.load(topk_ids + others, mask=others < live_numel, other=-1)
+        other_valid = (others < live_numel) & (other_raw >= 0) & (other_raw < NUM_EXPERTS)
+        other_ids = other_raw
+        if HAS_EXPERT_MAP:
+            other_safe = tl.minimum(tl.maximum(other_raw, 0), NUM_EXPERTS - 1)
+            other_ids = tl.load(expert_map + other_safe, mask=other_valid, other=-1)
+            other_valid = other_valid & (other_ids >= 0) & (other_ids < NUM_EXPERTS)
+        other_ids = tl.where(other_valid, other_ids.to(tl.int32), NUM_EXPERTS)
+        before += tl.histogram(other_ids, BINS)
+
+    offsets = pid * BLOCK_T + local
+    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1)
+    valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+    ids = raw_ids
+    if HAS_EXPERT_MAP:
+        safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
+        ids = tl.load(expert_map + safe_ids, mask=valid, other=-1)
+        valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+    ids = tl.where(valid, ids.to(tl.int32), NUM_EXPERTS)
+
+    keys = tl.sort(ids * BLOCK_T + local, descending=False)
+    sorted_ids = keys // BLOCK_T
+    sorted_local = keys % BLOCK_T
+    previous = tl.maximum(local - 1, 0)
+    previous_ids = tl.gather(sorted_ids, previous, axis=0)
+    first = (local == 0) | (sorted_ids != previous_ids)
+    starts = tl.associative_scan(tl.where(first, local, 0), 0, _route_group_start_maximum)
+    live = sorted_ids < NUM_EXPERTS
+    safe_sorted = tl.where(live, sorted_ids, 0)
+    segment = tl.load(expert_offsets + safe_sorted, mask=live, other=0)
+    earlier = tl.gather(before, safe_sorted, axis=0)
+    slots = segment + earlier + (local - starts)
+    tl.store(packed_route_indices + slots, pid * BLOCK_T + sorted_local, mask=live)
+
+
+def _route_sort_kernel():
+    return (_pack_topk_routes_stable_sort_kernel if _stable_route_pack_enabled()
+            else _pack_topk_routes_sort_kernel)
+
+
 @dataclass(frozen=True)
 class W4A16RoutePackLaunches:
     """Exact prepared Triton objects for one W4A16 packed-route geometry."""
@@ -481,7 +561,7 @@ def compile_w4a16_route_pack_launches(
                             1,
                         ),
                     )
-                programs[("sort", *key)] = _pack_topk_routes_sort_kernel.warmup(
+                programs[("sort", *key)] = _route_sort_kernel().warmup(
                     ids_dtype,
                     expert_map_dtype,
                     torch.int32,
@@ -876,7 +956,7 @@ def pack_topk_routes_by_expert(
             )
     if launches is None:
         launch_triton(
-            _pack_topk_routes_sort_kernel,
+            _route_sort_kernel(),
             sort_grid,
             topk_ids,
             expert_map_tensor,
