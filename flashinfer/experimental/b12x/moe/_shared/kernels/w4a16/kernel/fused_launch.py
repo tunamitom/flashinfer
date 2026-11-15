@@ -1134,6 +1134,27 @@ def _w4a16_fused_moe_launch_flat(
     )
 
 
+def cooperative_reserve_sms(sms: int) -> int:
+    """B12X_W4A16_COOP_RESERVE_SMS=R: the cooperative fused grid leaves R SMs free.
+
+    A cooperative grid is admitted only whole, and while it waits for
+    admission the device dispatches no later kernel from any stream. If a
+    kernel that waits on ANOTHER GPU (a PCIe flag wait) holds an SM the grid
+    needs, and the peer's matching flag-set sits behind the peer's own pending
+    grid, the GPUs wait on each other forever. A caller that bounds its
+    resident peer waits to at most R single-CTA kernels sets R: then the grid
+    always fits beside them and is admitted once ordinary kernels drain.
+    The grid size changes the split-K partition, so R is part of the numerics
+    (fixed per process, deterministic for a fixed R)."""
+    from b12x._lib.env import env_raw
+
+    raw = (env_raw("W4A16_COOP_RESERVE_SMS") or "").strip()
+    reserve = int(raw) if raw else 0
+    if reserve < 0 or reserve >= int(sms):
+        raise ValueError(f"B12X_W4A16_COOP_RESERVE_SMS={raw!r} must be in [0, {int(sms)})")
+    return reserve
+
+
 def _w4a16_fused_persistent_grid_x(
     *,
     fused: W4A16FusedMoeCompileResult,
@@ -1158,7 +1179,7 @@ def _w4a16_fused_persistent_grid_x(
     barrier never deadlocks. Falls back to the default for the route-pack path
     where the host cannot know route_blocks ahead of the launch.
     """
-    cap = int(sms) * int(fused.blocks_per_sm)
+    cap = (int(sms) - cooperative_reserve_sms(int(sms))) * int(fused.blocks_per_sm)
     if (
         fused.weight_layout in BLOCK_CODECS and fused.moe_block_size == 8
     ) or _w4a16_small_m_splitk_enabled():

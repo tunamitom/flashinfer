@@ -462,6 +462,13 @@ class PCIeDmaAllReduce:
         nxt = (rank + 1) % world
         prv = (rank - 1) % world
         dtype_code = SUPPORTED_DTYPES[inp.dtype]
+        # B12X_PCIE_DMA_SINGLE_CTA_WAITS=1: every peer wait of this ring is ONE
+        # CTA (no fused multi-CTA wait_add), so a caller can bound the SMs its
+        # resident peer waits hold (see cooperative_reserve_sms in the W4A16
+        # fused MoE launch). Read at capture time for the eager replays.
+        from b12x._lib.env import env_flag
+
+        single_cta_waits = env_flag("PCIE_DMA_SINGLE_CTA_WAITS")
         elem = inp.element_size()
         shard_elems = inp.numel() // world
         shard_bytes = shard_elems * elem
@@ -667,6 +674,19 @@ class PCIeDmaAllReduce:
                             reduced + piece_elems,
                             piece_elems,
                             k == world - 2,
+                        )
+                    elif single_cta_waits:
+                        # The same flag wait as the fused wait_add (counter
+                        # advanced once, flag >= counter), in ONE CTA; the
+                        # add then runs as an ordinary kernel. Bitwise the
+                        # same sum.
+                        kernels.dma_wait_flag(*wait[:2])
+                        kernels.dma_add(
+                            piece_ptr(recv_chunk, p),
+                            in_piece_ptr(recv_chunk, p),
+                            scratch_piece(rank, k, p),
+                            piece_elems,
+                            dtype_code,
                         )
                     else:
                         kernels.dma_add(
