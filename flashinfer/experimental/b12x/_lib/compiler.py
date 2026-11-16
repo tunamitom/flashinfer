@@ -2298,6 +2298,10 @@ def _memory_cache_put(cache_key: object, compiled: Any) -> None:
         _MEMORY_CACHE[cache_key] = compiled
         _MEMORY_CACHE.move_to_end(cache_key)
         while len(_MEMORY_CACHE) > _cute_compile_memory_cache_size():
+            from .compile_plan import programs_pinned
+
+            if programs_pinned():
+                break
             _MEMORY_CACHE.popitem(last=False)
 
 

@@ -56,6 +56,25 @@ _RESIDENT_PROGRAMS = weakref.WeakValueDictionary()
 _LIVE_RETAINED_PROGRAMS = weakref.WeakSet()
 _NATIVE_JITS = weakref.WeakSet()
 _PLANNED_TRITON_JITS = weakref.WeakSet()
+_PINNED = False
+
+
+def pin_programs():
+    """Stop every in-process program reclamation for the life of the process.
+
+    A captured CUDA graph holds raw CUfunction handles: once any graph that
+    launches b12x (or b12x-native Triton) kernels exists, evicting a compiled
+    program can drop the last reference to its module, unload it, and turn
+    the next replay into a segfault inside cuGraphLaunch. Graph owners call
+    this before their first capture; from then on the memory-cache LRU and
+    `evict_unretained` keep everything.
+    """
+    global _PINNED
+    _PINNED = True
+
+
+def programs_pinned():
+    return _PINNED
 
 
 def retained_program_keys():
@@ -141,6 +160,8 @@ def evict_planning_artifacts(programs: Iterable[ProgramKey] | None = None) -> in
 
 def evict_unretained_triton(keep):
     removed = 0
+    if _PINNED:
+        return removed
     for jit in tuple(_NATIVE_JITS):
         for kernel_cache, key_cache, *_ in jit.device_caches.values():
             obsolete = {

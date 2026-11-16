@@ -18,6 +18,7 @@ from .compile_plan import (
     _RESIDENT_PROGRAMS,
     evict_unretained_triton,
     program_keys,
+    programs_pinned,
     retained_program_keys,
 )
 
@@ -141,6 +142,8 @@ class program_cache:
 
 
 def evict_unretained(keep):
+    if programs_pinned():
+        return 0
     keep = frozenset(keep) | retained_program_keys()
     removed = sum(cache.evict_unretained(keep) for cache in tuple(_CACHES))
     for cache, mirrors, lock in _MAPPING_CACHES:
