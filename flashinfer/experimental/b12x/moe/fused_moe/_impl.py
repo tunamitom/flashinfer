@@ -3395,6 +3395,7 @@ def _plan_core_workspace(
     route_num_experts: int | None = None,
     w4a16_block_size_m: int | None = None,
     w4a16_prefill_fused_sum: bool | None = None,
+    w4a16_a4_prefill_terms: int = 0,
     trellis_bits: int = 3,
     trellis_tile_config: tuple[int, int, int, int] | None = None,
     trellis_pair_kinds: frozenset[str] | None = None,
@@ -3737,6 +3738,26 @@ def _plan_core_workspace(
                     ),
                 )
         intermediate_cache2_elements = routed_capacity * int(n)
+        if int(w4a16_a4_prefill_terms) > 0 and not full_rotation:
+            # Calibrated A4 prefill carves its whole pipeline from this cache
+            # (quantized input, intermediate, route pack): at TP-sharded
+            # intermediates that exceeds the A16 routes x width.
+            from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
+                a4_prefill_cache2_bytes,
+            )
+
+            a4_bytes = a4_prefill_cache2_bytes(
+                tokens=token_capacity,
+                topk=topk,
+                hidden_size=int(k),
+                intermediate_size=int(n),
+                num_experts=route_E,
+                terms=int(w4a16_a4_prefill_terms),
+            )
+            intermediate_cache2_elements = max(
+                intermediate_cache2_elements,
+                align_up(a4_bytes, _dtype_nbytes(dtype)) // _dtype_nbytes(dtype),
+            )
         if weight_layout == "modelopt" and not full_rotation:
             intermediate_cache2_elements = max(
                 intermediate_cache2_elements,
@@ -8388,6 +8409,7 @@ def plan_tp_moe_arena_layout(
     raw_routes: bool = False,
     w4a16_block_size_m: int | None = None,
     w4a16_prefill_fused_sum: bool | None = None,
+    w4a16_a4_prefill_terms: int = 0,
     decode_config: MoeDecodeConfig,
 ) -> TPMoEArenaLayout:
     """Compute the byte layout needed by one lane-owned MoE pool."""
@@ -8488,6 +8510,7 @@ def plan_tp_moe_arena_layout(
             route_num_experts=route_num_experts,
             w4a16_block_size_m=w4a16_block_size_m,
             w4a16_prefill_fused_sum=w4a16_prefill_fused_sum,
+            w4a16_a4_prefill_terms=w4a16_a4_prefill_terms,
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
@@ -9091,6 +9114,11 @@ def _resolve_trellis_route_block_size(caps: TPMoEScratchCaps) -> int | None:
     raise ValueError("Native Trellis projection tiles exceed shared-memory capacity")
 
 
+def _a4_prefill_terms(caps: TPMoEScratchCaps) -> int:
+    """A4 activation planes the workspace must hold (0: A4 prefill not enabled)."""
+    return int(caps.w4a16_a4_prefill_terms) if caps.w4a16_a4_prefill_enabled else 0
+
+
 def _plan_tp_moe_arena_layout_from_caps(
     caps: TPMoEScratchCaps,
     *,
@@ -9119,6 +9147,7 @@ def _plan_tp_moe_arena_layout_from_caps(
         raw_routes=caps.output_layout == "routes",
         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+        w4a16_a4_prefill_terms=_a4_prefill_terms(caps),
         decode_config=caps.decode_config,
     )
 
@@ -9180,6 +9209,7 @@ def plan_tp_moe_scratch(
         route_num_experts=caps.route_num_experts,
         w4a16_block_size_m=resolved_block_size_m,
         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+        w4a16_a4_prefill_terms=_a4_prefill_terms(caps),
         trellis_bits=caps.weight_plan.trellis_bits or 3,
         trellis_tile_config=caps.weight_plan.trellis_tile_config,
         trellis_pair_kinds=caps.weight_plan.trellis_pair_kinds,
@@ -9807,6 +9837,7 @@ def materialize_tp_moe_arena_workspaces(
             route_num_experts=caps.route_num_experts,
             w4a16_block_size_m=resolved_block_size_m,
             w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
+        w4a16_a4_prefill_terms=_a4_prefill_terms(caps),
             trellis_bits=weight_plan.trellis_bits or 3,
             trellis_tile_config=weight_plan.trellis_tile_config,
             trellis_pair_kinds=weight_plan.trellis_pair_kinds,

@@ -1368,6 +1368,47 @@ def compile_w4a16_a4_prefill(
     )
 
 
+def a4_prefill_cache2_bytes(
+    *,
+    tokens: int,
+    topk: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    terms: int,
+) -> int:
+    """Bytes of ``intermediate_cache2`` the A4 pipeline carves at ``tokens``,
+    computed from the geometry alone (the same carve as ``_carve_layout``,
+    with the route-pack capacity ``compile_w4a16_route_pack_launches`` plans).
+    Workspace planning sizes the A16 caches to at least this when A4 prefill
+    is enabled: at TP-sharded intermediates the A16 ``intermediate_cache2``
+    (routes x activated width) is smaller than the A4 quantized input alone."""
+    from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
+
+    tokens = int(tokens)
+    _, max_packed_routes, max_route_blocks = route_pack_capacity(
+        tokens * int(topk), int(A4_PREFILL_ROUTE_BLOCK), int(num_experts), topk=int(topk)
+    )
+    h, i, e = int(hidden_size), int(intermediate_size), int(num_experts)
+    routes = tokens * int(topk)
+    planes = int(terms)
+    sizes = (
+        planes * tokens * h // 2,
+        planes * tokens * h // 16,
+        planes * routes * i // 2,
+        planes * routes * i // 16,
+        max(int(max_packed_routes), 1) * 4,
+        max(int(max_route_blocks), 1) * 4,
+        4,
+        (e + 1) * 4,
+        e * 4,
+    )
+    offset = 0
+    for size in sizes:
+        offset = (offset + size + 255) // 256 * 256
+    return offset
+
+
 def _carve_layout(launches: W4A16A4PrefillLaunches, tokens: int):
     """Byte offsets of the pipeline buffers inside ``intermediate_cache2``."""
     h, i, e = launches.hidden_size, launches.intermediate_size, launches.num_experts
@@ -1560,6 +1601,7 @@ __all__ = [
     "PI",
     "WORD_ORDER",
     "W4A16A4PrefillLaunches",
+    "a4_prefill_cache2_bytes",
     "a4_prefill_fits",
     "a4_prefill_enabled",
     "a4_prefill_supported",

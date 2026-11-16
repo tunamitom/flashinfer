@@ -673,6 +673,10 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             fc1_pipeline_stages=caps.decode_config.w4a16_fc1_pipeline_stages,
             skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
             small_m_occupancy=caps.w4a16_small_m_occupancy,
+            # A calibrating plan (RoutingSpec.collect_activation_amax) binds
+            # activation_amax on every call; its packed launches must carry
+            # the amax epilogue or the run-time contract check rejects them.
+            collect_activation_amax=bool(caps.collect_activation_amax),
         )
         packed = compile_w4a16_fused_moe(
             **compiler_args,
