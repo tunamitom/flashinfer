@@ -645,6 +645,36 @@ class _FlagLaunch:
             _publish_flag_sys(flag_addr, counter_addr)
 
 
+class _MultiWaitLaunch:
+    """ONE single-thread kernel that runs `dma_wait_flag`'s wait for each of
+    `count` (flag, counter) pairs in order: the same flag protocol as `count`
+    single waits, one launch. Callers that need every source before going on
+    (the CE exchanges' merges) save count-1 launches."""
+
+    def __init__(self, count: int) -> None:
+        self._count = int(count)
+
+    @cute.jit
+    def __call__(self, flags: tuple, counters: tuple, stream: cuda.CUstream) -> None:
+        self.kernel(flags, counters).launch(
+            grid=(1, 1, 1),
+            block=(1, 1, 1),
+            cluster=(1, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(self, flags: tuple, counters: tuple) -> None:
+        for index in cutlass.range_constexpr(self._count):
+            _wait_flag_sys(
+                get_ptr_as_int64(_one_tensor(flags[index]), Int64(0)),
+                get_ptr_as_int64(_one_tensor(counters[index]), Int64(0)),
+            )
+
+
+MULTI_WAIT_MAX = 8
+
+
 class _AddLaunch:
     def __init__(self, dtype_name: str, wait=False) -> None:
         self._dtype_name = dtype_name
@@ -1292,6 +1322,18 @@ def _compiled_flag(wait: bool) -> Callable:
 
 
 @functools.cache
+def _compiled_multi_wait(count: int) -> Callable:
+    launch = _MultiWaitLaunch(count)
+    return _compile(
+        "comm.pcie_dma.multi_wait",
+        (int(count),),
+        launch,
+        tuple(_fake_ptr(Uint32, 4) for _ in range(count)),
+        tuple(_fake_ptr(Uint32, 4) for _ in range(count)),
+    )
+
+
+@functools.cache
 def _compiled_add(dtype_name: str, wait=False) -> Callable:
     dtype = _dtype_type(dtype_name)
     launch = _AddLaunch(dtype_name, wait)
@@ -1409,12 +1451,15 @@ class DmaLaunchers:
     dequant_accum: Callable | None = None
     dequant_add_quant_false: Callable | None = None
     dequant_add_quant_true: Callable | None = None
+    # wait_flags[n - 2]: one launch waiting n flags (n = 2..MULTI_WAIT_MAX)
+    wait_flags: tuple = ()
 
     @property
     def __b12x_dependencies__(self):
         return (
             self.set_flag,
             self.wait_flag,
+            self.wait_flags,
             self.add,
             self.wait_add,
             self.quant,
@@ -1443,6 +1488,7 @@ def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
     return DmaLaunchers(
         set_flag=_compiled_flag(False),
         wait_flag=_compiled_flag(True),
+        wait_flags=tuple(_compiled_multi_wait(n) for n in range(2, MULTI_WAIT_MAX + 1)),
         add=tuple(_compiled_add(dtype) for dtype in _DTYPES),
         wait_add=tuple(_compiled_add(dtype, True) for dtype in _DTYPES),
         quant=_compiled_quant(codec) if compressed else None,
@@ -1495,6 +1541,26 @@ class DmaKernels:
             _ptr(Uint32, counter_ptr, 4),
             current_cuda_stream(),
         )
+
+    def dma_wait_flags(self, flag_ptrs, counter_ptrs) -> None:
+        """Wait each (flag, counter) pair in order, in ONE launch (same protocol
+        as one `dma_wait_flag` per pair)."""
+        flags, counters = tuple(flag_ptrs), tuple(counter_ptrs)
+        if len(flags) != len(counters) or not flags:
+            raise ValueError("dma_wait_flags needs matching, non-empty flag/counter lists")
+        if len(flags) == 1:
+            return self.dma_wait_flag(flags[0], counters[0])
+        launchers = self._require_launchers()
+        if not 2 <= len(flags) <= len(launchers.wait_flags) + 1:
+            for flag, counter in zip(flags, counters):
+                self.dma_wait_flag(flag, counter)
+            return None
+        launchers.wait_flags[len(flags) - 2](
+            tuple(_ptr(Uint32, p, 4) for p in flags),
+            tuple(_ptr(Uint32, p, 4) for p in counters),
+            current_cuda_stream(),
+        )
+        return None
 
     def dma_add(
         self,
