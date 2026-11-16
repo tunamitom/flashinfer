@@ -316,7 +316,7 @@ class PCIeDmaAllReduce:
         max_elements: int | None = None,
         state=None,
     ) -> None:
-        """Precapture bounded-capacity lossless rings for later eager calls.
+        """Precapture bounded-capacity rings for later eager calls.
 
         Call collectively before serving. Powers-of-two capacities, capped at
         max_bytes, bound padding traffic without capturing on a request path.
@@ -326,8 +326,12 @@ class PCIeDmaAllReduce:
         max_elements bounds this dtype independently of the ring byte capacity,
         so preparing FP32 reductions does not double BF16 replay storage.
         """
-        if self._closed or self._fp8:
-            raise ValueError("eager replay requires an open lossless DMA ring")
+        # The ring-topology wires ("ag", "ring", "i8", "i8_ring", "mx", "mx_ring")
+        # run the same launch / peer-copy / event sequence as the lossless ring
+        # over persistent staging, so they capture the same way. The a2a wires
+        # take a separate path (with a priming synchronize) and stay eager.
+        if self._closed or self._fp8 in ("a2a", "i8_a2a", "mx_a2a"):
+            raise ValueError("eager replay requires an open ring-topology DMA wire")
         if dtype not in SUPPORTED_DTYPES:
             raise TypeError(f"unsupported DMA replay dtype: {dtype}")
         if max_elements is None:
