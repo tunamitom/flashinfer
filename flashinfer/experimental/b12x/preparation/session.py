@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import gc
 import hashlib
+import json
 import math
 import os
 import pickle
@@ -41,6 +42,7 @@ from b12x._lib.runtime_control import (
     kernel_resolution_guard,
 )
 from ._cache import SelectionCache, _json, cache_identity, digest
+from . import _tune_cache
 from ._efficiency import AutotuneEffort, capture_autotune_effort
 from ._discovery import discovery_key, discovery_record, restore_discovery
 from ._measurement import DEFAULT_SAMPLES, COLLECTIVE_MAX_ROUNDS
@@ -456,6 +458,13 @@ class PreparationSession:
         self.cache_dir = None if cache_dir is None else Path(cache_dir)
         self._cache = None
         self._race_cache = None
+        # N7: persistent offline-tune cache (B12X_TUNE_CACHE_MODE / _DIR). The
+        # mode defaults to off, so flag-off sessions read and write nothing.
+        self._tune_cache = None
+        self._tune_cache_mode = None
+        self._tune_cache_root = None
+        self._tune_cache_resolved = False
+        self._tune_audit = []
         self._stop = threading.Event()
         if os.environ.get("B12X_AUTOTUNE", "1") == "0":
             self._stop.set()
@@ -588,6 +597,88 @@ class PreparationSession:
             path = self._selection_cache().path.with_suffix(".progress.sqlite3")
             self._race_cache = RaceCache(path)
         return self._race_cache
+
+    def _tune_cache_settings(self):
+        """Resolve the N7 tune-cache mode and root once (env, then cache_dir)."""
+        if not self._tune_cache_resolved:
+            explicit = os.environ.get("B12X_TUNE_CACHE_MODE") or None
+            has_root = bool(
+                os.environ.get("B12X_TUNE_CACHE_DIR") or self.cache_dir is not None
+            )
+            # An offline HY4_MOE_AUTOTUNE=1 pass records every session in the
+            # process, including the autotune=False sessions (decode-op
+            # planning) whose selections are heuristic. A flag-off process
+            # stays off; an explicit mode always wins.
+            tune_pass = self._autotune_effort is not AutotuneEffort.OFF and (
+                os.environ.get("HY4_MOE_AUTOTUNE") or ""
+            ) not in ("", "0")
+            self._tune_cache_mode = _tune_cache.resolve_mode(
+                autotune=self.autotune or tune_pass,
+                explicit=explicit,
+                has_root=has_root,
+            )
+            self._tune_cache_root = _tune_cache.resolve_root(
+                mode=self._tune_cache_mode, cache_dir=self.cache_dir
+            )
+            self._tune_cache_resolved = True
+        return self._tune_cache_mode, self._tune_cache_root
+
+    def _tune_cache_for(self, mode):
+        """Return the persistent tune cache when this session runs in ``mode``."""
+        active, root = self._tune_cache_settings()
+        if active != mode or root is None:
+            return None
+        if self._tune_cache is None:
+            self._tune_cache = _tune_cache.TuneCache(
+                root,
+                arch=_tune_cache.arch_identity(self.device.identity),
+                session=self.session_id,
+            )
+        return self._tune_cache
+
+    def _tune_selection_made(self, job, obligation, selection):
+        """Audit every selection; persist every replayable winner in record mode.
+
+        Record mode captures exactly what frozen mode must replay: tuned and
+        cached race winners *and* the heuristic ``default`` selections a
+        no-race session (``autotune=False`` -- e.g. ``plan_decode_op``'s
+        decode-cap sessions) actually made. Pinned overrides replay from the
+        declaration itself, and frozen-mode replays never record.
+        """
+        mode, _root = self._tune_cache_settings()
+        if mode == "off":
+            return
+        plan = obligation.request.plan
+        self._tune_audit.append(
+            {
+                "request": obligation.request.name,
+                "component": plan.component_id,
+                "query": json.loads(_json(obligation.configuration.encoded_query)),
+                "config": json.loads(_json(plan.contract.config_payload(selection.config))),
+                "source": selection.source,
+            }
+        )
+        if mode == "record" and selection.source in ("tuned", "cached", "default"):
+            job._record_tune(obligation, selection)
+
+    def _close_tune_cache(self):
+        """Publish staged records and the audit manifest.
+
+        Runs at job boundaries as well as session close: ``plan_decode_op``
+        sessions are never closed, so their heuristic selections must still
+        reach disk when their preparation job completes (or unwinds).
+        """
+        from ._tune_cache import audit_path, write_audit
+
+        if self._tune_cache is not None:
+            self._tune_cache.flush()
+        mode, root = self._tune_cache_settings()
+        if mode != "off" and root is not None and self._tune_audit:
+            write_audit(
+                audit_path(root, self.session_id),
+                self._tune_audit,
+                session=self.session_id,
+            )
 
     def _gpu_scope(self):
         """Return the CUDA device context for preparation operations."""
@@ -968,6 +1059,8 @@ class PreparationSession:
             closers.append(lambda: guard.__exit__(None, None, None))
         if self._cache is not None:
             closers.append(self._cache.flush)
+        if self._tune_cache is not None or self._tune_audit:
+            closers.append(self._close_tune_cache)
         if self._race_cache is not None:
             cache, self._race_cache = self._race_cache, None
             closers.append(cache.close)
@@ -1397,6 +1490,8 @@ class PreparationJob:
         self._discovery_locks.clear()
         if self.session._cache is not None:
             closers.append(self.session._cache.flush)
+        if self.session._tune_cache is not None or self.session._tune_audit:
+            closers.append(self.session._close_tune_cache)
         if self._result is None:
             closers.extend(reversed(self._benchmark_closers))
             self._benchmark_closers.clear()
@@ -1471,13 +1566,119 @@ class PreparationJob:
             self.session._candidate_memory(
                 obligation.requests or (obligation.request,), config
             )
-        return Selection(
+        selection = Selection(
             obligation.request.plan.component_id,
             obligation.configuration.encoded_query,
             config,
             source,
             assignment,
         )
+        self.session._tune_selection_made(self, obligation, selection)
+        return selection
+
+    def _tune_provenance(self, obligation, selections):
+        """Build the kernel + shape + arch version record for one obligation."""
+        contract = obligation.request.plan.contract
+        dependencies = []
+        for name in obligation.request.dependencies:
+            if name not in selections:
+                return None
+            selection, dep_contract = selections[name]
+            dependencies.append(
+                {
+                    "component": selection.component_id,
+                    "query": selection.query.to_dict(),
+                    "config": dep_contract.config_payload(selection.config).to_dict(),
+                    "semantic_version": dep_contract.semantic_version,
+                }
+            )
+        configuration = obligation.configuration
+        return _tune_cache.build_provenance(
+            contract,
+            encoded_query=configuration.encoded_query,
+            invocation=obligation.request.plan.invocation,
+            pin=None
+            if configuration.pinned is None
+            else contract.config_payload(configuration.pinned),
+            dependencies=dependencies,
+            device_identity=self.session.device.identity,
+        )
+
+    def _record_tune(self, obligation, selection):
+        """Stage one winning selection for the persistent tune cache."""
+        cache = self.session._tune_cache_for("record")
+        if cache is None:
+            return
+        provenance = self._tune_provenance(obligation, self._selections or {})
+        if provenance is None:
+            logger.warning(
+                "tune cache: not recording %s (%s); a dependency selection is "
+                "unresolved",
+                obligation.request.name,
+                obligation.request.plan.component_id,
+            )
+            return
+        contract = obligation.request.plan.contract
+        cache.record(
+            provenance,
+            contract.config_payload(selection.config),
+            assignment=selection.assignment,
+            coverage=dict(getattr(obligation, "coverage", None) or {}),
+            extra={
+                "request": obligation.request.name,
+                "source": selection.source,
+                "candidate_programs": obligation.candidate_program_identity,
+                "session": self.session.session_id,
+            },
+        )
+
+    def _frozen_tune_selection(self, obligation, selections):
+        """N7 frozen replay: resolve the offline winner with zero racing.
+
+        Only single-product, heuristic-off, or pinned declarations bypass the
+        cache; every tunable obligation must resolve from the cache, and a
+        stale or missing record raises loudly instead of degrading silently.
+        """
+        cache = self.session._tune_cache_for("frozen")
+        if cache is None:
+            return None
+        configuration = obligation.configuration
+        if configuration.pinned is not None:
+            return None
+        plan = obligation.request.plan
+        space = plan.contract.parameter_space(
+            plan.query, self.session.device.identity
+        )
+        if (
+            space is None
+            or space.autotune_effort is AutotuneEffort.OFF
+            or all(len(knob.values) == 1 for knob in space.knobs)
+        ):
+            return None
+        provenance = self._tune_provenance(obligation, selections)
+        if provenance is None:
+            logger.warning(
+                "frozen tune cache: unresolved dependency for %s (%s); falling "
+                "back to the heuristic default",
+                obligation.request.name,
+                plan.component_id,
+            )
+            return None
+        record = cache.resolve(provenance)
+        payload = FrozenMapping(record.get("assignment") or record["config"])
+        config = plan.contract._lower(
+            configuration.query, configuration.device, payload
+        )
+        requests = obligation.requests or (obligation.request,)
+        requirement = self.session._candidate_memory(requests, config)
+        baseline = self.session._candidate_memory(requests, configuration.default)
+        if requirement.scratch_nbytes > baseline.scratch_nbytes:
+            raise _tune_cache.TuneCacheError(
+                f"frozen tune cache: {plan.component_id} configuration needs "
+                f"{requirement.scratch_nbytes} scratch bytes, above the "
+                f"{baseline.scratch_nbytes} prepared for the heuristic default"
+            )
+        return self._selection(obligation, config, "frozen", payload)
 
     def _validate_retained_scratch(self, obligation, prepared):
         if self.session._scratch_limit is None:
@@ -2917,6 +3118,12 @@ class PreparationJob:
                 return obligation.selection
             if prepared is not None:
                 return prepared.selection
+            if (
+                obligation.selection is not None
+                and obligation.selection.source == "frozen"
+            ):
+                # N7 frozen replay: the offline-tuned winner is authoritative.
+                return obligation.selection
             if default_selection is None:
                 configuration = obligation.configuration
                 source = "override" if configuration.pinned is not None else "default"
@@ -3289,7 +3496,10 @@ class PreparationJob:
                     source = (
                         "override" if configuration.pinned is not None else "default"
                     )
-                    obligation.selection = self._selection(
+                    frozen = None
+                    if configuration.pinned is None:
+                        frozen = self._frozen_tune_selection(obligation, selections)
+                    obligation.selection = frozen or self._selection(
                         obligation, configuration.default, source
                     )
                 completed_before_selection = self._benchmarked + self._restored
@@ -3334,6 +3544,11 @@ class PreparationJob:
         if self.session._cache is not None:
             with self._timing.span("cache_save"):
                 self.session._cache.flush()
+        # N7: publish tune records and the audit at the job boundary too --
+        # decode-op sessions (plan_decode_op) are never closed, so their
+        # heuristic selections must not stay staged until a close that never
+        # comes.
+        self.session._close_tune_cache()
         for name, (request, children) in composites.items():
             plan = request.plan
             child_plans = {count: child.plan for count, child in children.items()}
