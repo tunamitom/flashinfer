@@ -27,6 +27,9 @@ _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 512
 # int32 per sort block, scanned in place by a small prefix kernel.
 _BLOCK_PREFIX_BLOCK_E = 32
 _BLOCK_PREFIX_MAX_BLOCKS = 256
+# M3a crossover guard (junction item 4b): below this many sort blocks the
+# legacy 1-launch rescan is 1-2us faster (neon-m3a-graph-probe.json R<=512).
+_M3A_MIN_SORT_BLOCKS = 32
 
 
 _FAST_COUNT_BLOCK_T = 1024
@@ -285,11 +288,21 @@ def block_counts_usable(
     num_experts: int,
     stable: bool,
 ) -> bool:
-    """Whether the M3a block-histogram fast path can serve this launch."""
+    """Whether the M3a block-histogram fast path can serve this launch.
+
+    Lever-2 M3a guard (junction item 4b): the O(N) scatter only wins once the
+    legacy O(num_blocks^2) rescan has real work — the SPARE CUDA-graph A/B
+    (``neon-m3a-graph-probe.json``) shows M3a slower by ``+24.8%`` at
+    ``R=256`` (8 sort blocks) and ``+9.7%`` at ``R=512`` (16 sort blocks)
+    while winning from ``R=1024`` (32 sort blocks) up. Below
+    ``_M3A_MIN_SORT_BLOCKS`` the caller keeps the faster 1-launch legacy path;
+    outputs stay bit-identical either way (the block histogram is a pure
+    scheduling optimization).
+    """
     return bool(
         stable
         and block_counts is not None
-        and 0 < int(num_blocks) <= _BLOCK_PREFIX_MAX_BLOCKS
+        and _M3A_MIN_SORT_BLOCKS <= int(num_blocks) <= _BLOCK_PREFIX_MAX_BLOCKS
         and int(num_blocks) * int(num_experts) <= int(block_counts.numel())
     )
 

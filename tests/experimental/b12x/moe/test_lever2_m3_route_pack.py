@@ -185,3 +185,35 @@ def test_block_counts_usable_gating():
     assert not block_counts_usable(
         scratch, num_blocks=0, num_experts=256, stable=True
     )
+
+
+def test_block_counts_usable_min_sort_blocks_guard():
+    """M3a crossover guard (junction item 4b): `num_blocks >= 32` sort blocks.
+
+    Decode/prefill row math at topk=8, `_SORT_BLOCK_T=256`:
+    R=256 -> 8 blocks, R=512 -> 16 blocks (legacy 1-launch path is 1-2us
+    faster there per the SPARE graph A/B), R=1024 -> 32 blocks (M3a wins).
+    """
+    class _Fake:
+        def __init__(self, n):
+            self._n = n
+
+        def numel(self):
+            return self._n
+
+    big = _Fake(256 * 256)
+    assert not block_counts_usable(
+        big, num_blocks=8, num_experts=256, stable=True
+    )  # R=256: legacy
+    assert not block_counts_usable(
+        big, num_blocks=16, num_experts=256, stable=True
+    )  # R=512: legacy
+    assert not block_counts_usable(
+        big, num_blocks=31, num_experts=256, stable=True
+    )  # just below the guard
+    assert block_counts_usable(
+        big, num_blocks=32, num_experts=256, stable=True
+    )  # R=1024: M3a
+    assert block_counts_usable(
+        big, num_blocks=64, num_experts=256, stable=True
+    )  # R=2048: M3a
