@@ -11,7 +11,10 @@ import torch
 
 from b12x._lib.compile_plan import launch_triton
 
-from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
+from b12x.moe._shared.kernels.w4a16.host import (
+    route_pack_capacity,
+    route_pack_numel_capacity,
+)
 
 
 _COUNT_BLOCK_T = 256
@@ -19,6 +22,11 @@ _SORT_BLOCK_T = 256
 _POST_PREFIX_BLOCK_T = 256
 _SMALL_PREFIX_MAX_PACKED_ROUTES = 4096
 _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 512
+
+# Stable-sort block histogram scratch (Lever-2 M3a): one row of NUM_EXPERTS
+# int32 per sort block, scanned in place by a small prefix kernel.
+_BLOCK_PREFIX_BLOCK_E = 32
+_BLOCK_PREFIX_MAX_BLOCKS = 256
 
 
 _FAST_COUNT_BLOCK_T = 1024
@@ -28,6 +36,11 @@ _SORTED_PACK_MAX_ROUTES = 128
 @triton.jit
 def _route_group_start_maximum(a, b):
     return tl.maximum(a, b)
+
+
+@triton.jit
+def _route_block_sum(a, b):
+    return a + b
 
 
 @triton.jit
@@ -160,6 +173,78 @@ def _w4a16_route_prefix_from_counts_kernel(
     tl.store(packed_route_count, total)
 
 
+@triton.jit
+def _pack_topk_routes_block_hist_kernel(
+    topk_ids,
+    expert_map,
+    block_counts,
+    live_numel,
+    NUM_EXPERTS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Per-sort-block expert histogram for the stable scatter (Lever-2 M3a).
+
+    Row ``pid`` of ``block_counts`` counts this block's valid routes per
+    expert (invalid routes are dropped). Together with
+    ``_pack_topk_routes_block_prefix_kernel`` this replaces the stable
+    sort's O(num_blocks^2) earlier-block rescan with O(1) lookups while
+    keeping the exact same placement math."""
+    pid = tl.program_id(0)
+    local = tl.arange(0, BLOCK_T)
+    offsets = pid * BLOCK_T + local
+    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1)
+    valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+    ids = raw_ids
+    if HAS_EXPERT_MAP:
+        safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
+        ids = tl.load(expert_map + safe_ids, mask=valid, other=-1)
+        valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+    ids = tl.where(valid, ids.to(tl.int32), NUM_EXPERTS)
+    BINS: tl.constexpr = triton.next_power_of_2(NUM_EXPERTS + 1)
+    hist = tl.histogram(ids, BINS)
+    cols = tl.arange(0, BINS)
+    tl.store(
+        block_counts + pid * NUM_EXPERTS + cols,
+        hist,
+        mask=cols < NUM_EXPERTS,
+    )
+
+
+@triton.jit
+def _pack_topk_routes_block_prefix_kernel(
+    block_counts,
+    num_blocks,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    """In-place exclusive per-expert prefix across sort blocks (Lever-2 M3a).
+
+    Afterwards ``block_counts[pid, e]`` holds the number of expert-``e``
+    routes in blocks ``< pid`` — exactly the ``before`` vector the stable
+    scatter consumes. Rows past ``num_blocks`` read as zero and are not
+    written back."""
+    pid = tl.program_id(0)
+    cols = pid * BLOCK_E + tl.arange(0, BLOCK_E)
+    rows = tl.arange(0, BLOCK_B)
+    col_mask = cols < NUM_EXPERTS
+    row_mask = rows < num_blocks
+    mask = row_mask[:, None] & col_mask[None, :]
+    tile = tl.load(
+        block_counts + rows[:, None] * NUM_EXPERTS + cols[None, :],
+        mask=mask,
+        other=0,
+    )
+    inclusive = tl.associative_scan(tile, 0, _route_block_sum)
+    before = inclusive - tile
+    tl.store(
+        block_counts + rows[:, None] * NUM_EXPERTS + cols[None, :],
+        before,
+        mask=mask,
+    )
+
+
 def _next_power_of_2(x: int) -> int:
     return 1 << (int(x) - 1).bit_length()
 
@@ -178,6 +263,35 @@ def _numel_capacity_for_route_workspace(
     if padded_slots <= fully_padded_experts:
         return padded_slots // block_size
     return padded_slots - num_experts * (block_size - 1)
+
+
+def route_block_counts_elements(numel: int, topk: int, num_experts: int) -> int:
+    """Int32 elements for the stable route-pack block histogram scratch (M3a).
+
+    Sizing covers the largest live route count the prepared geometry can see,
+    capped at ``_BLOCK_PREFIX_MAX_BLOCKS`` sort blocks (the prefix kernel's
+    row budget). At Hy4 prefill R=4096 this is 128 blocks x 256 experts =
+    128 KiB.
+    """
+    numel_capacity = route_pack_numel_capacity(numel, topk)
+    num_blocks = (numel_capacity + _SORT_BLOCK_T - 1) // _SORT_BLOCK_T
+    return min(num_blocks, _BLOCK_PREFIX_MAX_BLOCKS) * int(num_experts)
+
+
+def block_counts_usable(
+    block_counts: torch.Tensor | None,
+    *,
+    num_blocks: int,
+    num_experts: int,
+    stable: bool,
+) -> bool:
+    """Whether the M3a block-histogram fast path can serve this launch."""
+    return bool(
+        stable
+        and block_counts is not None
+        and 0 < int(num_blocks) <= _BLOCK_PREFIX_MAX_BLOCKS
+        and int(num_blocks) * int(num_experts) <= int(block_counts.numel())
+    )
 
 
 def _workspace_slice(
@@ -356,11 +470,15 @@ def _pack_topk_routes_sort_kernel(
     expert_map,
     packed_route_indices,
     expert_offsets,
+    block_counts,
     live_numel,
     NUM_EXPERTS: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    USE_BLOCK_COUNTS: tl.constexpr,
 ):
+    # Shares the stable twin's signature (including the M3a block_counts slot,
+    # which this atomic kernel never reads).
     pid = tl.program_id(0)
     offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1)
@@ -396,10 +514,12 @@ def _pack_topk_routes_stable_sort_kernel(
     expert_map,
     packed_route_indices,
     expert_offsets,
+    block_counts,
     live_numel,
     NUM_EXPERTS: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    USE_BLOCK_COUNTS: tl.constexpr,
 ):
     """Deterministic twin of `_pack_topk_routes_sort_kernel` (a stable counting sort).
 
@@ -408,23 +528,36 @@ def _pack_topk_routes_stable_sort_kernel(
     order-free), plus its rank among this block's same-expert routes in route
     order (one sort of unique keys). No atomics; `expert_offsets` stays the
     segment bases (the atomic kernel advances it to the ends; no consumer
-    reads it afterwards)."""
+    reads it afterwards).
+
+    Lever-2 M3a: with ``USE_BLOCK_COUNTS`` the earlier-block histograms come
+    from the ``block_counts`` scratch built by the block-hist + block-prefix
+    kernels (O(N) total). The legacy per-block rescan loop is retained as the
+    fallback for callers without that scratch."""
     BINS: tl.constexpr = triton.next_power_of_2(NUM_EXPERTS + 1)
     pid = tl.program_id(0)
     local = tl.arange(0, BLOCK_T)
 
     before = tl.zeros((BINS,), dtype=tl.int32)
-    for block in range(0, pid):
-        others = block * BLOCK_T + local
-        other_raw = tl.load(topk_ids + others, mask=others < live_numel, other=-1)
-        other_valid = (others < live_numel) & (other_raw >= 0) & (other_raw < NUM_EXPERTS)
-        other_ids = other_raw
-        if HAS_EXPERT_MAP:
-            other_safe = tl.minimum(tl.maximum(other_raw, 0), NUM_EXPERTS - 1)
-            other_ids = tl.load(expert_map + other_safe, mask=other_valid, other=-1)
-            other_valid = other_valid & (other_ids >= 0) & (other_ids < NUM_EXPERTS)
-        other_ids = tl.where(other_valid, other_ids.to(tl.int32), NUM_EXPERTS)
-        before += tl.histogram(other_ids, BINS)
+    if USE_BLOCK_COUNTS:
+        bins = tl.arange(0, BINS)
+        before = tl.load(
+            block_counts + pid * NUM_EXPERTS + bins,
+            mask=bins < NUM_EXPERTS,
+            other=0,
+        )
+    else:
+        for block in range(0, pid):
+            others = block * BLOCK_T + local
+            other_raw = tl.load(topk_ids + others, mask=others < live_numel, other=-1)
+            other_valid = (others < live_numel) & (other_raw >= 0) & (other_raw < NUM_EXPERTS)
+            other_ids = other_raw
+            if HAS_EXPERT_MAP:
+                other_safe = tl.minimum(tl.maximum(other_raw, 0), NUM_EXPERTS - 1)
+                other_ids = tl.load(expert_map + other_safe, mask=other_valid, other=-1)
+                other_valid = other_valid & (other_ids >= 0) & (other_ids < NUM_EXPERTS)
+            other_ids = tl.where(other_valid, other_ids.to(tl.int32), NUM_EXPERTS)
+            before += tl.histogram(other_ids, BINS)
 
     offsets = pid * BLOCK_T + local
     raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1)
@@ -566,13 +699,66 @@ def compile_w4a16_route_pack_launches(
                     expert_map_dtype,
                     torch.int32,
                     torch.int32,
+                    torch.int32,
                     live_numel,
                     NUM_EXPERTS=int(num_experts),
                     HAS_EXPERT_MAP=has_expert_map,
                     BLOCK_T=_SORT_BLOCK_T,
+                    USE_BLOCK_COUNTS=False,
                     num_warps=4,
                     grid=(triton.cdiv(int(tokens) * int(topk), _SORT_BLOCK_T), 1, 1),
                 )
+                if _stable_route_pack_enabled():
+                    # Lever-2 M3a: O(N) stable scatter via block histograms.
+                    programs[("sort_bc", *key)] = (
+                        _pack_topk_routes_stable_sort_kernel.warmup(
+                            ids_dtype,
+                            expert_map_dtype,
+                            torch.int32,
+                            torch.int32,
+                            torch.int32,
+                            live_numel,
+                            NUM_EXPERTS=int(num_experts),
+                            HAS_EXPERT_MAP=has_expert_map,
+                            BLOCK_T=_SORT_BLOCK_T,
+                            USE_BLOCK_COUNTS=True,
+                            num_warps=4,
+                            grid=(
+                                triton.cdiv(int(tokens) * int(topk), _SORT_BLOCK_T),
+                                1,
+                                1,
+                            ),
+                        )
+                    )
+                    programs[("block_hist", *key)] = (
+                        _pack_topk_routes_block_hist_kernel.warmup(
+                            ids_dtype,
+                            expert_map_dtype,
+                            torch.int32,
+                            live_numel,
+                            NUM_EXPERTS=int(num_experts),
+                            HAS_EXPERT_MAP=has_expert_map,
+                            BLOCK_T=_SORT_BLOCK_T,
+                            num_warps=4,
+                            grid=(
+                                triton.cdiv(int(tokens) * int(topk), _SORT_BLOCK_T),
+                                1,
+                                1,
+                            ),
+                        )
+                    )
+        if _stable_route_pack_enabled():
+            programs[("block_prefix", torch.int32, False)] = (
+                _pack_topk_routes_block_prefix_kernel.warmup(
+                    torch.int32,
+                    3,
+                    NUM_EXPERTS=int(num_experts),
+                    BLOCK_B=_BLOCK_PREFIX_MAX_BLOCKS,
+                    BLOCK_E=_BLOCK_PREFIX_BLOCK_E,
+                    num_warps=4,
+                    grid=(triton.cdiv(int(num_experts), _BLOCK_PREFIX_BLOCK_E), 1, 1),
+                )
+            )
         if not use_small_prefix:
             programs[("prefix", torch.int32, False)] = (
                 _w4a16_route_prefix_from_counts_kernel.warmup(
@@ -636,6 +822,7 @@ def pack_topk_routes_by_expert(
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
     expert_counts: torch.Tensor | None = None,
+    block_counts: torch.Tensor | None = None,
     launches: W4A16RoutePackLaunches | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     numel = int(topk_ids.numel())
@@ -770,6 +957,16 @@ def pack_topk_routes_by_expert(
 
     block_e = _next_power_of_2(num_experts)
     sort_grid = (triton.cdiv(numel, _SORT_BLOCK_T),)
+    num_sort_blocks = sort_grid[0]
+    # Lever-2 M3a: O(N) stable scatter via the caller-owned block-histogram
+    # scratch when available; the O(num_blocks^2) loop remains the fallback.
+    use_block_counts = block_counts_usable(
+        block_counts,
+        num_blocks=num_sort_blocks,
+        num_experts=int(num_experts),
+        stable=_stable_route_pack_enabled(),
+    )
+    sort_block_counts = block_counts if use_block_counts else packed_route_indices
     expert_map_tensor = expert_map if expert_map is not None else topk_ids
 
     block_route_init = _next_power_of_2(max(max_packed_routes, 1))
@@ -954,6 +1151,51 @@ def pack_topk_routes_by_expert(
                 _POST_PREFIX_BLOCK_T,
                 block_e.bit_length(),
             )
+    if use_block_counts:
+        if launches is None:
+            launch_triton(
+                _pack_topk_routes_block_hist_kernel,
+                (num_sort_blocks,),
+                topk_ids,
+                expert_map_tensor,
+                block_counts,
+                numel,
+                NUM_EXPERTS=int(num_experts),
+                HAS_EXPERT_MAP=expert_map is not None,
+                BLOCK_T=_SORT_BLOCK_T,
+                num_warps=4,
+            )
+            launch_triton(
+                _pack_topk_routes_block_prefix_kernel,
+                (triton.cdiv(int(num_experts), _BLOCK_PREFIX_BLOCK_E),),
+                block_counts,
+                num_sort_blocks,
+                NUM_EXPERTS=int(num_experts),
+                BLOCK_B=_BLOCK_PREFIX_MAX_BLOCKS,
+                BLOCK_E=_BLOCK_PREFIX_BLOCK_E,
+                num_warps=4,
+            )
+        else:
+            _launch_prepared(
+                launches.program("block_hist", topk_ids, expert_map is not None),
+                (num_sort_blocks,),
+                topk_ids,
+                expert_map_tensor,
+                block_counts,
+                numel,
+                int(num_experts),
+                expert_map is not None,
+                _SORT_BLOCK_T,
+            )
+            _launch_prepared(
+                launches.programs[("block_prefix", torch.int32, False)],
+                (triton.cdiv(int(num_experts), _BLOCK_PREFIX_BLOCK_E),),
+                block_counts,
+                num_sort_blocks,
+                int(num_experts),
+                _BLOCK_PREFIX_MAX_BLOCKS,
+                _BLOCK_PREFIX_BLOCK_E,
+            )
     if launches is None:
         launch_triton(
             _route_sort_kernel(),
@@ -962,30 +1204,40 @@ def pack_topk_routes_by_expert(
             expert_map_tensor,
             packed_route_indices,
             expert_offsets,
+            sort_block_counts,
             numel,
             NUM_EXPERTS=int(num_experts),
             HAS_EXPERT_MAP=expert_map is not None,
             BLOCK_T=_SORT_BLOCK_T,
+            USE_BLOCK_COUNTS=use_block_counts,
             num_warps=4,
         )
     else:
         _launch_prepared(
-            launches.program("sort", topk_ids, expert_map is not None),
+            launches.program(
+                "sort_bc" if use_block_counts else "sort",
+                topk_ids,
+                expert_map is not None,
+            ),
             sort_grid,
             topk_ids,
             expert_map_tensor,
             packed_route_indices,
             expert_offsets,
+            sort_block_counts,
             numel,
             int(num_experts),
             expert_map is not None,
             _SORT_BLOCK_T,
+            use_block_counts,
         )
     return packed_route_indices, block_expert_ids, packed_route_count
 
 
 __all__ = [
     "W4A16RoutePackLaunches",
+    "block_counts_usable",
     "compile_w4a16_route_pack_launches",
     "pack_topk_routes_by_expert",
+    "route_block_counts_elements",
 ]

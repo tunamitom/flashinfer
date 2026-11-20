@@ -108,6 +108,7 @@ from b12x.moe._shared.kernels.w4a16.kernel.config import (
     _scale_group_size,
     _w4a16_pipeline_stages,
     _w4a16_small_m_splitk_enabled,
+    native_bf16_e2m1_dequant_enabled,
 )
 
 
@@ -392,6 +393,14 @@ class W4A16GemmKernel:
             )
         self.native_nvfp4_scales = (
             weight_layout == "modelopt" and scale_format == "e4m3_k16"
+        )
+        # Lever-2 M5 probe: route BF16 packed e4m3_k16 unpacking through
+        # SM120's native cvt.rn.bf16x2.e2m1x2. Inert at the default "0"; the
+        # M5 gate (bit-exact A/B on real weights) must pass before enabling.
+        self.native_bf16_e2m1 = (
+            native_bf16_e2m1_dequant_enabled()
+            and weight_layout == "packed"
+            and scale_format == "e4m3_k16"
         )
         self.scale_format_e8m0_k32 = scale_format == "e8m0_k32"
         # k32 scale cadence (two K16 rows share one scale group); the scale
@@ -3427,7 +3436,9 @@ class W4A16GemmKernel:
 
     @cute.jit
     def _scaled_dequant_b_fragment(self, frag: cute.Tensor, q: Uint32, s: Uint32):
-        if cutlass.const_expr(self.native_nvfp4_scales and self.is_fp16):
+        if cutlass.const_expr(
+            (self.native_nvfp4_scales and self.is_fp16) or self.native_bf16_e2m1
+        ):
             b0_0, b0_1, b1_0, b1_1 = _dequant_native_fp4_word(q, self.is_fp16)
         else:
             bq1 = q

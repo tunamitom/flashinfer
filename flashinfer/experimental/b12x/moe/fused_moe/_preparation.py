@@ -1496,6 +1496,37 @@ class _FusedMoeCapacityState:
         return binding.run()
 
 
+def _fused_route_pack_geometry(
+    *,
+    routes: int,
+    slots: int,
+    blocks: int,
+    rounded: int,
+    threads: int,
+    route_e: int,
+    first_experts: int,
+    block_m: int,
+):
+    """Gate + normalize the fused CsfRoutePack geometry (Lever-2 M1).
+
+    Returns the packed geometry tuple ``(routes, block_m, slots, blocks)`` or
+    ``None`` when the fused pack cannot serve this route workspace. The fused
+    program performs its own bounded direct dedup (one prior-slot check per
+    thread), so it is valid for any route capacity within the CTA thread count
+    regardless of the tuned ``direct_routes`` setting.
+    """
+    if (
+        not 0 < routes <= 128
+        or slots > 4096
+        or rounded > threads
+        or route_e != first_experts
+        or routes >= 16 * route_e
+        or (route_e + 1) * rounded > 2**31
+    ):
+        return None
+    return (routes, block_m, max(slots, 1), max(blocks, 1))
+
+
 def plan(
     experts: PreparedExperts,
     *,
@@ -1639,21 +1670,19 @@ def plan(
                 min(getattr(plane, "groups_per_task", 8), 8) * 32
                 for plane in (first, second)
             )
-            if (
-                not 0 < routes <= 128
-                or slots > 4096
-                or rounded > threads
-                or core.route_E != first.num_experts
-                or routes >= 16 * core.route_E
-                or (routes >= 64 and not direct_routes)
-                or (core.route_E + 1) * rounded > 2**31
-            ):
-                return None
-            return (
-                first.geometry,
-                second.geometry,
-                (routes, block_m, max(slots, 1), max(blocks, 1)),
+            geometry = _fused_route_pack_geometry(
+                routes=routes,
+                slots=slots,
+                blocks=blocks,
+                rounded=rounded,
+                threads=threads,
+                route_e=core.route_E,
+                first_experts=first.num_experts,
+                block_m=block_m,
             )
+            if geometry is None:
+                return None
+            return (first.geometry, second.geometry, geometry)
 
         def compile_jobs(config, device):
             route_query = _route_query_from_moe(query, routing)

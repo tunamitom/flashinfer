@@ -19,6 +19,24 @@ from b12x.preparation import (
     make_fixed_contract,
 )
 
+import os
+
+
+def _w4a16_csf_min_tokens() -> int:
+    """Token floor for inline CSF scale staging.
+
+    ``B12X_W4A16_CSF_MIN_TOKENS`` (default 16) lets the Lever-2 M1 sweep probe
+    raising the floor once expanded+packed expansion beats inline staging at
+    cap 16; the probe must be set before preparation because the choice is
+    baked into the prepared binding contract.
+    """
+    value = os.environ.get("B12X_W4A16_CSF_MIN_TOKENS", "16")
+    if not value.isdecimal() or not 1 <= int(value) <= 4096:
+        raise ValueError(
+            "B12X_W4A16_CSF_MIN_TOKENS must be an integer in [1, 4096]"
+        )
+    return int(value)
+
 
 @dataclass(frozen=True)
 class MoeDecodeQuery:
@@ -794,7 +812,7 @@ def _csf_default_config(query, config, device):
                 config = replace(config, dynamic_tile_m=32)
     # Expansion amortizes repeated decoding at high expert occupancy; tiny
     # launches and compact N64 kernels retain expansion as their default.
-    min_tokens = 8 if query.quant_mode == "w4a8_mx" else 16
+    min_tokens = 8 if query.quant_mode == "w4a8_mx" else _w4a16_csf_min_tokens()
     max_rows_per_expert = 32 if query.quant_mode == "w4a8_mx" else 16
     return replace(
         config,

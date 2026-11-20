@@ -31,8 +31,31 @@ _PACK_FACTOR = 8
 _STAGES = 4
 
 
+# In-process probe override for B12X_W4A16_SMALL_M_OCCUPANCY (Lever-2 M0).
+# The occupancy choice is baked into compiled kernels (pipeline stages and
+# blocks-per-sm participate in their cache keys), so the override must be set
+# before plan/compile time, exactly like the environment variable it shadows.
+_SMALL_M_OCCUPANCY_PROBE: int | None = None
+
+def small_m_occupancy_probe(value: int | None) -> int | None:
+    """Pin (1/2) or release (None) the small-M occupancy selection.
+
+    Returns the previous override so harnesses can restore it. Passing an
+    integer other than 1 or 2 raises ValueError.
+    """
+    global _SMALL_M_OCCUPANCY_PROBE
+    if value is not None and type(value) is not int:
+        raise TypeError("small-M occupancy probe must be an int or None")
+    if value is not None and value not in (1, 2):
+        raise ValueError("small-M occupancy probe must be 1, 2, or None")
+    previous = _SMALL_M_OCCUPANCY_PROBE
+    _SMALL_M_OCCUPANCY_PROBE = None if value is None else int(value)
+    return previous
+
 def _w4a16_small_m_occupancy() -> int:
     """Resolve the packed NVFP4 small-M schedule: one CTA/four stages or two/three."""
+    if _SMALL_M_OCCUPANCY_PROBE is not None:
+        return _SMALL_M_OCCUPANCY_PROBE
     value = os.environ.get("B12X_W4A16_SMALL_M_OCCUPANCY", "1")
     if value not in ("1", "2"):
         raise ValueError("B12X_W4A16_SMALL_M_OCCUPANCY must be 1 or 2")
@@ -94,6 +117,68 @@ def _lut_e4m3_smem_enabled() -> bool:
     """
 
     return os.environ.get("B12X_LUT_E4M3_SMEM", "1") == "1"
+
+
+def _w4a16_prefill_tile_pin() -> tuple[int, int, int] | None:
+    """Optional (tile_k, tile_n, cta_threads) pin for the Lever-2 M4 sweep.
+
+    ``B12X_W4A16_PREFILL_TILE`` is ``"auto"`` (default) or a triple such as
+    ``"64,128,128"`` drawn from ``_LARGE_BATCH_TILE_CONFIGS``. The pin applies
+    to large-M (prefill) tile selection only and still has to pass the regular
+    candidate geometry rules; anything else raises so the sweep fails loudly
+    instead of silently benchmarking the wrong tile.
+    """
+    value = os.environ.get("B12X_W4A16_PREFILL_TILE", "auto")
+    if value == "auto":
+        return None
+    parts = value.split(",")
+    if len(parts) != 3:
+        raise ValueError(
+            "B12X_W4A16_PREFILL_TILE must be 'auto' or 'tile_k,tile_n,threads'"
+        )
+    try:
+        pin = (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError as exc:
+        raise ValueError(
+            "B12X_W4A16_PREFILL_TILE must be 'auto' or 'tile_k,tile_n,threads'"
+        ) from exc
+    if pin not in _LARGE_BATCH_TILE_CONFIGS:
+        raise ValueError(
+            f"B12X_W4A16_PREFILL_TILE must be one of {_LARGE_BATCH_TILE_CONFIGS}"
+        )
+    return pin
+
+
+def _w4a16_pipeline_stages_pin() -> int | None:
+    """Optional pipeline-stage pin for the Lever-2 M4 sweep.
+
+    ``B12X_W4A16_PIPELINE_STAGES_PIN`` is ``"auto"`` (default) or one of
+    ``2``/``3``/``4``/``5``; an explicitly passed ``pipeline_stages`` argument
+    still wins. The value participates in compiled geometry and must be set
+    before plan/compile time.
+    """
+    value = os.environ.get("B12X_W4A16_PIPELINE_STAGES_PIN", "auto")
+    if value == "auto":
+        return None
+    if value not in ("2", "3", "4", "5"):
+        raise ValueError(
+            "B12X_W4A16_PIPELINE_STAGES_PIN must be auto, 2, 3, 4, or 5"
+        )
+    return int(value)
+
+
+def native_bf16_e2m1_dequant_enabled() -> bool:
+    """Probe switch for native ``cvt.rn.bf16x2.e2m1x2`` BF16 unpacking (M5).
+
+    ``B12X_W4A16_NATIVE_BF16_DEQUANT`` is ``"0"`` (default) or ``"1"``. The
+    native SM120 conversion represents every E2M1 value exactly in BF16, but
+    the packed-layout word/nibble mapping and scale-lift ordering must be
+    A/B-verified bit-exact (plan M5 gate) before enabling this in production.
+    """
+    value = os.environ.get("B12X_W4A16_NATIVE_BF16_DEQUANT", "0")
+    if value not in ("0", "1"):
+        raise ValueError("B12X_W4A16_NATIVE_BF16_DEQUANT must be 0 or 1")
+    return value == "1"
 
 
 _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
@@ -572,6 +657,9 @@ def _w4a16_pipeline_stages(
         if type(pipeline_stages) is not int or pipeline_stages not in (2, 3, 4, 5):
             raise ValueError("W4A16 pipeline_stages must be 2, 3, 4 or 5")
         return pipeline_stages
+    pinned_stages = _w4a16_pipeline_stages_pin()
+    if pinned_stages is not None:
+        return pinned_stages
     if weight_layout in BLOCK_CODECS and tile_n == 128 and tile_k == 128:
         return 2
     if (
@@ -848,11 +936,16 @@ def _select_tile_config(
     configs = (
         _LARGE_BATCH_TILE_CONFIGS if cta_m_blocks > 1 else _SMALL_BATCH_TILE_CONFIGS
     )
+    # Lever-2 M4 sweep pin: force one large-M tile triple end-to-end.
+    pinned_tile = _w4a16_prefill_tile_pin() if cta_m_blocks > 1 else None
+    if pinned_tile is not None:
+        configs = (pinned_tile,)
     best_occupancy = 0
     best_tile_config: tuple[int, int, int, int] | None = None
     candidates = tuple((config, False) for config in configs)
     if (
-        weight_layout == "packed"
+        pinned_tile is None
+        and weight_layout == "packed"
         and not allow_logical_tail
         and int(problem_k) % 64 == 32
     ):

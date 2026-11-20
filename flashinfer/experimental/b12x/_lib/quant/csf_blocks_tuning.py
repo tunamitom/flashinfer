@@ -11,6 +11,8 @@ times the expert count expand every expert at every effort.
 
 from dataclasses import asdict, dataclass, field, replace
 
+import os
+
 import torch
 
 from b12x._lib.compile_pool import CompileJob
@@ -61,6 +63,37 @@ class CsfExpansionConfig:
 
 def _uses_presence(query):
     return 64 <= query.routes < 16 * query.first[6]
+
+
+def _default_direct_routes(query) -> bool:
+    """Untuned default for direct per-slot CSF deduplication (Lever-2 M1).
+
+    Route capacities 64..128 (Hy4 decode caps 8/16 = 64/128 routes) previously
+    defaulted to the two-launch presence path (``mark_active_experts`` + a
+    256-expert mode-2 expansion), which also silently disabled the fused
+    ``CsfRoutePack`` at exactly the packed-GEMM route boundary. Direct dedup
+    expands every active expert exactly once (first route occurrence), which is
+    bit-identical to presence expansion, and shrinks the expansion grid to
+    ``routes * tasks`` CTAs. Default it on for presence-routed capacities that
+    fit the fused route pack (``routes <= 128``) and the direct-tuning
+    predicate (``routes <= E``); autotune may still select either value.
+    """
+    return _uses_presence(query) and query.routes <= min(128, query.first[6])
+
+
+def _default_groups_per_task() -> int:
+    """Untuned work-per-CTA default.
+
+    ``B12X_CSF_GROUPS_PER_TASK`` lets the M1 sweep harness price 16/32-group
+    tasks (fewer CTAs, shorter duplicate scans) without code edits; the value
+    participates in compiled geometry and must be set before preparation.
+    """
+    value = os.environ.get("B12X_CSF_GROUPS_PER_TASK", "8")
+    if value not in ("1", "2", "4", "8", "16", "32", "64"):
+        raise ValueError(
+            "B12X_CSF_GROUPS_PER_TASK must be 1, 2, 4, 8, 16, 32, or 64"
+        )
+    return int(value)
 
 
 def _validate_query(query, device):
@@ -126,6 +159,15 @@ def _parameters(query, device):
     )
 
 
+def _default_config(query, device):
+    direct = _default_direct_routes(query)
+    return CsfExpansionConfig(
+        groups_per_task=_default_groups_per_task(),
+        bitmap_routes=_uses_presence(query) and not direct,
+        direct_routes=direct,
+    )
+
+
 TUNING = TuningContract(
     component_id="quantization.csf_block_expansion",
     query_schema_version=9,
@@ -138,9 +180,7 @@ TUNING = TuningContract(
     decode_config=CsfExpansionConfig.from_config,
     validate_query=_validate_query,
     validate_config=_validate_config,
-    default_config=lambda query, device: CsfExpansionConfig(
-        bitmap_routes=_uses_presence(query)
-    ),
+    default_config=_default_config,
     knobs=(
         Knob(name="groups_per_task", values=(1, 2, 4, 8, 16, 32, 64)),
         Knob(name="shared_exceptions", values=(False, True)),

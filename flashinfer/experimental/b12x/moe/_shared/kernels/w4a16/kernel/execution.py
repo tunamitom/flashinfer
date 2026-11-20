@@ -145,6 +145,7 @@ def pack_topk_routes_by_expert(
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
     expert_counts: torch.Tensor | None = None,
+    block_counts: torch.Tensor | None = None,
     launches=None,
     stream: cuda.CUstream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -166,6 +167,7 @@ def pack_topk_routes_by_expert(
         packed_route_count=packed_route_count,
         expert_offsets=expert_offsets,
         expert_counts=expert_counts,
+        block_counts=block_counts,
         launches=launches,
     )
 
@@ -568,6 +570,7 @@ def run_w4a16_moe(
     packed_route_count: torch.Tensor | None = None,
     expert_offsets: torch.Tensor | None = None,
     expert_counts: torch.Tensor | None = None,
+    route_block_counts: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
     output_expert_map: torch.Tensor | None = None,
     activation_amax: torch.Tensor | None = None,
@@ -1196,6 +1199,7 @@ def run_w4a16_moe(
                     packed_route_count=packed_route_count,
                     expert_offsets=expert_offsets,
                     expert_counts=expert_counts,
+                    block_counts=route_block_counts,
                     launches=route_pack_launches,
                     stream=stream,
                 )

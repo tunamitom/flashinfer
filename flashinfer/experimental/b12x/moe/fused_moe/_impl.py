@@ -281,6 +281,7 @@ class TPW4A16Workspace:
     packed_route_count: torch.Tensor
     expert_offsets: torch.Tensor
     expert_counts: torch.Tensor | None = None
+    route_block_counts: torch.Tensor | None = None
     full_rotation_output: torch.Tensor | None = None
     rotation_a_gate: torch.Tensor | None = None
     rotation_a_up: torch.Tensor | None = None
@@ -1283,6 +1284,7 @@ class TPMoEFP4Binding:
     packed_route_count: torch.Tensor | None = None
     expert_offsets: torch.Tensor | None = None
     expert_counts: torch.Tensor | None = None
+    route_block_counts: torch.Tensor | None = None
     rotation_a_gate: torch.Tensor | None = None
     rotation_a_up: torch.Tensor | None = None
     kernel_workspace: torch.Tensor | None = None
@@ -3246,6 +3248,7 @@ def _build_tp_moe_fp4_binding_from_views(
             packed_route_count=tensors["packed_route_count"],
             expert_offsets=tensors["expert_offsets"],
             expert_counts=tensors.get("expert_counts"),
+            route_block_counts=tensors.get("route_block_counts"),
             rotation_a_gate=tensors.get("rotation_a_gate"),
             rotation_a_up=(
                 tensors.get("rotation_a_gate")
@@ -3811,6 +3814,10 @@ def _plan_core_workspace(
             if use_prefill_fused_sum
             else routed_capacity * max(fc1_cols, int(k))
         )
+        from b12x.moe._shared.kernels.w4a16.route_pack import (
+            route_block_counts_elements,
+        )
+
         tensor_specs = [
             _TensorAllocSpec(
                 "intermediate_cache13",
@@ -3831,6 +3838,11 @@ def _plan_core_workspace(
             _TensorAllocSpec("packed_route_count", (1,), torch.int32),
             _TensorAllocSpec("expert_offsets", (route_E + 1,), torch.int32),
             _TensorAllocSpec("expert_counts", (route_E,), torch.int32),
+            _TensorAllocSpec(
+                "route_block_counts",
+                (route_block_counts_elements(routed_capacity, int(num_topk), route_E),),
+                torch.int32,
+            ),
         ]
         if use_prefill_fused_sum:
             tensor_specs.append(
@@ -4393,6 +4405,7 @@ def _materialize_workspace_from_core_arena(
             packed_route_count=tensors["packed_route_count"],
             expert_offsets=tensors["expert_offsets"],
             expert_counts=tensors.get("expert_counts"),
+            route_block_counts=tensors.get("route_block_counts"),
             full_rotation_output=tensors.get("full_rotation_output"),
             rotation_a_gate=tensors.get("rotation_a_gate"),
             rotation_a_up=(
@@ -10281,6 +10294,7 @@ def build_tp_moe_fp4_binding(
             packed_route_count=workspace.packed_route_count,
             expert_offsets=workspace.expert_offsets,
             expert_counts=workspace.expert_counts,
+            route_block_counts=workspace.route_block_counts,
             rotation_a_gate=workspace.rotation_a_gate,
             rotation_a_up=workspace.rotation_a_up,
             kernel_workspace=workspace.kernel_workspace,
@@ -13996,6 +14010,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
             packed_route_count=packed_route_count,
             expert_offsets=expert_offsets,
             expert_counts=_require_binding_field(binding, "expert_counts"),
+            route_block_counts=getattr(binding, "route_block_counts", None),
             expert_map=binding.route_expert_map,
             output_expert_map=binding.output_expert_map,
             activation_amax=activation_amax,
