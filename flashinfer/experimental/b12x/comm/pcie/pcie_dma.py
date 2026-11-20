@@ -23,6 +23,12 @@ from torch.distributed import ProcessGroup
 from b12x.preparation.types import Plan, require_prepared
 
 from ._dma_kernels import DmaKernels
+from ._dma_sync_trim import (
+    ReplayBindPolicy,
+    parse_bind_mode,
+    parse_sync_trim,
+    replay_bind_key,
+)
 from ._cuda_ipc import CudaRTLibrary
 from .pcie_oneshot import PCIeOneshotAllReduce, _normalize_device
 
@@ -263,6 +269,18 @@ class PCIeDmaAllReduce:
             self._fp8_stage_stride = stride
         self._pieces_override = int(os.getenv("B12X_PCIE_DMA_PIECES", "0"))
         self._a2a_chunks_override = int(os.getenv("B12X_PCIE_DMA_A2A_CHUNKS", "0"))
+        # N4b (NEON-LEVERS): sync/staging trim of the eager-replay path.  The
+        # trims are numerics-neutral (same launches, same reduction order);
+        # `B12X_PCIE_DMA_SYNC_TRIM=0` restores the legacy ordering and
+        # `B12X_PCIE_DMA_REPLAY_BIND=1` additionally binds replay graphs to the
+        # caller's own buffers (drops the replay path's 2 x payload staging
+        # copies; see _dma_sync_trim).  Both are read once per channel so a
+        # captured graph stays consistent with its channel.
+        self._sync_trim = parse_sync_trim(os.getenv("B12X_PCIE_DMA_SYNC_TRIM"))
+        self._bind = ReplayBindPolicy(
+            parse_bind_mode(os.getenv("B12X_PCIE_DMA_REPLAY_BIND")),
+            cap=int(os.getenv("B12X_PCIE_DMA_REPLAY_BIND_MAX", "4")),
+        )
         self.min_bytes = 0
         wire_modes = {
             "i8": "int8-ag",
@@ -451,6 +469,23 @@ class PCIeDmaAllReduce:
         replays = self._eager_replays.get(inp.dtype)
         if replays is not None and not torch.cuda.is_current_stream_capturing():
             elements = inp.numel()
+            # N4b: a recurring (in, out, elements, dtype) key replays a graph
+            # captured over the caller's own buffers — no staging copies.  The
+            # exact key match gates every replay; anything else falls back to
+            # the private staged graph below.
+            key = replay_bind_key(inp.data_ptr(), out.data_ptr(), elements,
+                                  inp.dtype)
+            decision = self._bind.observe(key)
+            if decision == "match":
+                self._bind.bound[key].replay()
+                return out
+            if decision == "bind":
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    self._run_prepared(inp, out=out, state=state)
+                self._bind.commit(key, graph)
+                graph.replay()
+                return out
             replay = next(
                 (item for item in replays if item[0].numel() >= elements), None
             )
@@ -561,7 +596,12 @@ class PCIeDmaAllReduce:
         add_done = self._piece_events
         flag_stream = self._flag_stream
         copied = self._copied_events
-        flag_stream.wait_event(self._input_ready)
+        if not self._sync_trim:
+            flag_stream.wait_event(self._input_ready)
+        # N4b (sync trim): the first flag publish is already ordered behind
+        # `copied[slot(0, 0)]`, which the copy stream records after
+        # `wait_event(self._input_ready)` — the extra input-ready edge on the
+        # flag stream is redundant and dropped.
 
         def fp8_scratch_piece(owner: int, step: int, piece: int) -> int:
             return self._scratch_ptr(owner, step) + piece * piece_slice_bytes
@@ -727,12 +767,26 @@ class PCIeDmaAllReduce:
         # Neighbor handshake so the next call (or graph replay) cannot
         # overwrite scratch a lagging neighbor still reads. The main stream
         # must also drain the copy and flag streams before the op is done.
-        main.wait_stream(copy_stream)
-        main.wait_stream(flag_stream)
         done = steps * pieces
-        kernels.dma_set_flag(
-            self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
-        )
+        if self._sync_trim:
+            # N4b (sync trim): the handshake's "my reads are done" publish is
+            # ordered by this rank's own scratch reads alone (every read of a
+            # received payload — the ring adds and the all-gather forward
+            # copies — runs on `main`), so it fires before draining the send
+            # streams; the receive-side wait below still cannot complete until
+            # the lagging neighbor consumed every send, which is what protects
+            # the next call's scratch writes.
+            kernels.dma_set_flag(
+                self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
+            )
+            main.wait_stream(copy_stream)
+            main.wait_stream(flag_stream)
+        else:
+            main.wait_stream(copy_stream)
+            main.wait_stream(flag_stream)
+            kernels.dma_set_flag(
+                self._flag_ptr(prv, done), self._counter_ptr(self._send_counters, done)
+            )
         kernels.dma_wait_flag(
             self._flag_ptr(rank, done), self._counter_ptr(self._wait_counters, done)
         )
@@ -1021,6 +1075,7 @@ class PCIeDmaAllReduce:
         # the exported slab.
         torch.cuda.synchronize(self.device)
         self._eager_replays.clear()
+        self._bind.release()
         dist.barrier(group=self.group)
         for ptr in self._slab.remote_ptrs:
             with suppress(Exception):
